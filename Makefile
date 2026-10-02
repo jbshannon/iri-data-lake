@@ -15,6 +15,11 @@ FIXTURE_OUTPUT := $(OUT)/bronze/iri_sales/year=1/category=beer/channel=drug
 # Input for `make sweep`. Override: make sweep SWEEP_FILE=data/raw/Year1/...
 SWEEP_FILE ?= $(FIXTURE_INPUT)
 
+# Age (hours) a `*.tmp` leftover under $(OUT) must reach before
+# `make clean-tmp` deletes it. Matches the CLI default
+# (--tmp-max-age-hours); the age gate protects a concurrent run.
+TMP_MAX_AGE_HOURS ?= 24
+
 # ---- Targets ---------------------------------------------------------------
 
 .PHONY: help
@@ -32,7 +37,7 @@ help:
 	@echo "  make ingest         Ingest a single file into $(FIXTURE_OUTPUT)"
 	@echo "  make ingest-all     Walk $(IN) and ingest every eligible sales file"
 	@echo "  make clean          cargo clean + remove criterion/ and target/"
-	@echo "  make fixtures       Re-emit test fixtures into tests/fixtures/"
+	@echo "  make clean-tmp      Delete stale *.tmp leftovers under $(OUT) (older than $(TMP_MAX_AGE_HOURS)h)"
 	@echo "  make readiness      Gated plan for the full 143 GB corpus run"
 
 .PHONY: fmt
@@ -80,9 +85,10 @@ clean:
 	$(BIN) clean
 	rm -rf criterion/ benches/target/
 
-.PHONY: fixtures
-fixtures:
-	$(BIN) test --test fixtures_emit -- --nocapture
+.PHONY: clean-tmp
+clean-tmp:
+	@find $(OUT) -type f -name '*.tmp' -mmin +$$(( $(TMP_MAX_AGE_HOURS) * 60 )) -print -delete 2>/dev/null; \
+		echo "clean-tmp: swept $(OUT) for *.tmp older than $(TMP_MAX_AGE_HOURS)h"
 
 # ---- Full-corpus run -------------------------------------------------------
 
