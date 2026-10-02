@@ -321,18 +321,103 @@ decisions. A "slow scan" finding usually points at:
 
 ## Profiling notes
 
-When the headline number isn't good enough, drill in:
+### Why `cargo flamegraph --bench parse_sales` does not work
 
-- **CPU profiling.** `cargo flamegraph --bench parse_sales` with the
-  `flamegraph` cargo subcommand. Expect hot spots in:
-  - `SalesBuilders::append_value` (Arrow type dispatch),
-  - `parquet`'s Zstd encoder,
-  - `sha256` (verify it's not in the hot path — we hash before mmap).
-- **Cache behaviour.** `perf stat -e cache-misses,cache-references`
-  while running `parse_and_parquet`.
-- **I/O queue depth.** `iostat -x 1` during a real run; if `%util`
-  is near 100 but `await` is small, you're saturated and adding
-  threads helps. If `await` is large, you're queue-bound.
+Two independent reasons, both of which cost time to discover:
+
+1. **The binary has no symbols.** `strip = "symbols"` in
+   `[profile.release]` is inherited by `[profile.bench]`, so the
+   benchmark binary ships with zero DWARF sections and exactly one
+   function symbol (`_main`). Anything sampling it produces
+   unattributed stacks.
+2. **It profiles the wrong program.** `benches/parse_sales.rs` never
+   calls `sha256_of_file` and loads input with `fs::read` into a `Vec`,
+   not `Mmap` — it does not exercise the path production runs.
+
+Use the `profiling` profile (`Cargo.toml`), which sets `debug = 1` and
+`strip = "none"`, and profile the real binary:
+
+```bash
+RUSTFLAGS="-C force-frame-pointers=yes" \
+  cargo build --profile profiling --bin iri-lake
+
+./target/profiling/iri-lake benchmark <file> --repeats 8 &
+sample $(pgrep -x iri-lake) 20 -file /tmp/sample.txt
+inferno-collapse-sample /tmp/sample.txt > /tmp/folded.txt
+inferno-flamegraph  /tmp/folded.txt > /tmp/fg.svg
+```
+
+Two macOS caveats:
+
+- `cargo flamegraph` itself needs `xctrace`, which requires **full
+  Xcode** (only Command Line Tools are needed here). `sample` + `inferno`
+  is the dependency-light equivalent and needs no `sudo`.
+- `force-frame-pointers` is a rustc flag, not a Cargo profile key
+  (Cargo warns `unused manifest key` if you add it to `Cargo.toml`).
+  It is worth setting: frame pointers make stacks unwind correctly.
+
+### Do not trust `inferno-collapse-sample` percentages
+
+It dropped 43 % of samples on our run (8 882 of 15 646), so every
+share computed from its output is inflated by ~1.76×. On our run it
+reported `sha2` at 79.8 % when the true figure is 45.3 %. Read the
+per-frame weights out of `sample.txt`'s own `Sort by top of stack`
+section (weights are trailing, not leading) and divide by the thread
+total from the call-graph root. Cross-check against wall clock: if the
+profile disagrees with `outer_elapsed - inner_elapsed` by more than a
+few points, the profile is wrong, not the timer.
+
+### Measured hot spots
+
+`fzdinent_groc_1114_1165` (765 MiB / 14.3 M rows), 8 repeats, 20 s
+sample, 15 646 samples, self time:
+
+| region | share |
+|---|---:|
+| `sha2::sha256::compress256` | 45.3 % |
+| parser + Arrow builders (`parse_records_into_builder`, `trim_matches`, `from_utf8`, `parse_uint`) | 26.4 % |
+| Parquet encode/write (`arrow_writer::write_primitive`, `RleEncoder`, `LevelInfoBuilder`) | 23.4 % |
+| zstd codec (`ZSTD_compressBlock_fast`, `HUF_*`, `FSE_*`) | 2.5 % |
+| syscalls (`read`, `write`) | 1.5 % |
+| memcpy/memset | 0.3 % |
+
+Call-site totals from the same profile agree with wall clock:
+`sha256_of_file` at `ingest.rs:171` accounts for 46.2 % of samples and
+the parse/Parquet region at `ingest.rs:290` for 53.8 %, versus 42.7 %
+measured from the outer-minus-inner timer delta.
+
+**SHA-256 is the single hottest function in the pipeline** — the
+opposite of the old claim that it needed verifying because "we hash
+before mmap". `sha256_of_file` runs before the `IngestStats` timer
+starts, so no metric this crate reports will ever show it.
+
+**The zstd codec itself is cheap (2.5 %).** Parquet's *encoding* layer —
+dictionary/RLE/bit-packing — costs 23.4 %, an order of magnitude more
+than the compression that runs on top of it. This is the concrete form
+of the finding in § Measured codec sweep: optimising the codec is
+optimising the wrong 2.5 %.
+
+**`trim_matches` (8.2 %) + `from_utf8` (5.7 %) + `parse_uint` (4.7 %)
+total ~18.6 % of self time** — the third-largest region, and larger
+than Parquet's entire encoding layer. This directly contradicts the
+long-standing claim in § Things that look slow but are not that the
+`str::from_utf8 + trim + parse` chain is "< 5 % of wall time" and not
+worth touching. At 18.6 %, alongside sha2 at 45.3 %, the two hashing
+costs dominate the pipeline rather than Parquet. `trim_matches` alone
+at 8.2 % suggests the cost is in generic `char::is_whitespace`
+dispatch rather than the integer parse itself. That is now an open
+experiment, not a dismissed one — see below.
+
+### Other tools
+
+- **Cache behaviour.** `perf stat -e cache-misses` is **Linux-only** and
+  unavailable here. Use `xctrace` (needs full Xcode) or reason from the
+  syscall share instead.
+- **I/O queue depth.** `iostat -x 1` during a real run; if `%util` is
+  near 100 but `await` is small, you're saturated and adding threads
+  helps. If `await` is large, you're queue-bound. Note the measured
+  syscall share is only 1.5 %, so I/O is not the constraint on warm
+  data — consistent with the 0.06 s re-read noted above.
 
 ## Things we *intend* to leave slow
 
@@ -361,6 +446,11 @@ yourself hashing is free. It is not: it is the single largest item in
 the pipeline, and the ingest is still compute-bound long after disk I/O
 stops mattering (0.06 s to re-read the file).
 
+A sampling profile independently confirms this: `sha2::sha256::
+compress256` is **45.3 %** of self time, and the `sha256_of_file` call
+site accounts for 46.2 % of samples, against 42.7 % from the wall-clock
+delta. The other stages are ~54 %.
+
 If ingest throughput ever becomes the goal, dropping or parallelising
 the hash is the single biggest win available — it would roughly halve
 end-to-end time. We keep it because the idempotence guarantee is worth
@@ -370,7 +460,26 @@ guarantee is ever in question.
 
 ## Things that look slow but are not
 
-- The 7-char `str::from_utf8 + trim + parse` chain on each integer
-  field. Profiling shows it's < 5% of wall time on a Zstd-bound run.
-  Replacing it with a hand-rolled ASCII→int would buy back < 2% at
-  the cost of clarity.
+*(This section previously claimed the ASCII path was "< 5 % of wall
+time". A sampling profile measured it at ~18.6 % — see § Profiling
+notes. The claim was never re-measured after the row-group and codec
+findings, and it is wrong by roughly 4×.)*
+
+- The 7-char `str::from_utf8 + trim + parse` chain. It **used to** be
+  listed here as a non-issue. It is not one: `trim_matches` 8.2 %,
+  `from_utf8` 5.7 %, `parse_uint` 4.7 %.
+
+  The original dismissal was that replacing it "would buy back < 2 %".
+  At ~18.6 % of self time, that estimate is untenable — the fixed-width
+  parser's UTF-8/trim validation is a bigger cost than the entire
+  Parquet encoding layer (23.4 %) put next to it, and comparable to
+  SHA-256.
+
+  **Open question, not a settled one.** `trim_matches` being the single
+  largest frame in the parser suggests the win is in avoiding generic
+  `char::is_whitespace` dispatch, not in the integer parse. Measure it
+  before writing it and before dismissing it again; the prior two
+  assessments of this path were both made without profiling it.
+
+- The Parquet **zstd codec** specifically (2.5 %). Compression is the
+  cheap part of the writer; its encoding layer is 23.4 %.
