@@ -222,28 +222,98 @@ fn iri_key_field(rec: &[u8]) -> &[u8] {
     IRI_KEY.slice(rec)
 }
 
+/// Parse a fixed-width ASCII integer field straight from bytes.
+///
+/// This replaces a `from_utf8 -> str::trim -> FromStr` chain that a
+/// sampling profile put at ~18.6% of parse self time. Both steps were
+/// wasted work on this format:
+///
+/// * `from_utf8` validated UTF-8 on fields that are ASCII digits by
+///   construction — and any byte >= 0x80 fails the digit test below
+///   anyway, so the validation was redundant.
+/// * `str::trim` applies *Unicode* whitespace rules through
+///   `char::is_whitespace`, dispatching on multi-byte code points, for
+///   fields that are space-padded (0x20) ASCII. `trim_matches` was the
+///   single largest frame in the parser.
+///
+/// Accepts optional leading/trailing ASCII spaces, an optional `+`/`-`
+/// sign, and ASCII digits. Non-UTF-8 bytes now surface as "not a
+/// digit" rather than "non-utf8"; a fixed-width ASCII format has no
+/// legitimate non-UTF-8 field, so the distinction is not worth a
+/// validation pass over every row.
 #[inline]
-fn parse_uint<T>(field: &[u8], name: &'static str) -> Result<T, String>
-where
-    T: std::str::FromStr<Err = std::num::ParseIntError>,
-{
-    let s = match std::str::from_utf8(field) {
-        Ok(s) => s,
-        Err(_) => return Err(format!("{:02x?} (non-utf8 in {})", field, name)),
-    };
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+fn parse_int64(field: &[u8], name: &str) -> Result<i64, String> {
+    let n = field.len();
+    let mut i = 0;
+    while i < n && field[i] == b' ' {
+        i += 1;
+    }
+
+    let mut negative = false;
+    if i < n && (field[i] == b'-' || field[i] == b'+') {
+        negative = field[i] == b'-';
+        i += 1;
+    }
+
+    let mut acc: u64 = 0;
+    let mut digits = 0usize;
+    while i < n {
+        let byte = field[i];
+        if byte == b' ' {
+            // Trailing padding. Everything after the first space must
+            // also be a space, otherwise this is an interior blank.
+            i += 1;
+            while i < n {
+                if field[i] != b' ' {
+                    return Err(format!("{:?} (non-space after digits in {})", field, name));
+                }
+                i += 1;
+            }
+            break;
+        }
+        let d = byte.wrapping_sub(b'0');
+        if d > 9 {
+            return Err(format!("{:?} (non-digit in {})", field, name));
+        }
+        // The widest integer field in the layout is 8 bytes, so a u64
+        // accumulator cannot overflow in 19 or fewer digits; check the
+        // bound here rather than paying two checked ops per digit.
+        // The guard must precede the multiply -- a 20-digit field would
+        // otherwise overflow the accumulator itself (a panic in debug
+        // builds) before any post-loop check could run.
+        if digits == 19 {
+            return Err(format!("{:?} (overflow in {})", field, name));
+        }
+        acc = acc * 10 + d as u64;
+        digits += 1;
+        i += 1;
+    }
+
+    if digits == 0 {
         return Err(format!("{:?} (empty {})", field, name));
     }
-    trimmed
-        .parse::<T>()
-        .map_err(|e| format!("{:?} ({}: {:?})", field, name, e))
+    if acc > i64::MAX as u64 {
+        return Err(format!("{:?} (overflow in {})", field, name));
+    }
+    let v = acc as i64;
+    Ok(if negative { -v } else { v })
 }
 
 #[inline]
+fn parse_uint<T>(field: &[u8], name: &'static str) -> Result<T, String>
+where
+    T: TryFrom<i64>,
+{
+    parse_int64(field, name)?
+        .try_into()
+        .map_err(|_| format!("{:?} ({} out of range)", field, name))
+}
+
+/// `units` is signed: sales can be negative for returns.
+#[inline]
 fn parse_int<T>(field: &[u8], name: &'static str) -> Result<T, String>
 where
-    T: std::str::FromStr<Err = std::num::ParseIntError>,
+    T: TryFrom<i64>,
 {
     parse_uint::<T>(field, name)
 }
@@ -394,5 +464,41 @@ mod tests {
         assert!(!pr);
         // `category` and `channel` are no longer physical columns —
         // they come back as virtual columns via Hive partitioning.
+    }
+
+    #[test]
+    fn parse_int64_handles_padding_sign_and_errors() {
+        // Space-padded ASCII, the actual on-disk shape.
+        assert_eq!(parse_int64(b"  12345", "f").unwrap(), 12345);
+        assert_eq!(parse_int64(b"  12345   ", "f").unwrap(), 12345);
+        assert_eq!(parse_int64(b"0", "f").unwrap(), 0);
+        assert!(parse_int64(b"     ", "f").is_err(), "empty after trim");
+
+        // Signs: `+` was accepted by `FromStr` before, keep it.
+        assert_eq!(parse_int64(b" +42", "f").unwrap(), 42);
+        assert_eq!(parse_int64(b"-42", "f").unwrap(), -42);
+
+        // Rejections.
+        assert!(parse_int64(b"12 34", "f").is_err(), "interior blank");
+        assert!(parse_int64(b"12a4", "f").is_err(), "non-digit");
+        assert!(parse_int64(b"\xff\xfe", "f").is_err(), "non-ascii");
+        assert!(parse_int64(b"", "f").is_err(), "empty field");
+
+        // Overflow is caught once, at the end.
+        assert!(parse_int64(b"99999999999999999999", "f").is_err());
+        assert_eq!(parse_int64(b"9223372036854775807", "f").unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn parse_uint_range_checks_the_target_type() {
+        // A value that fits i64 but not the narrower target.
+        assert_eq!(parse_uint::<u16>(b" 65535", "week").unwrap(), 65535);
+        assert!(parse_uint::<u16>(b" 65536", "week").is_err(), "u16 overflow");
+        assert_eq!(parse_uint::<u8>(b" 255", "ge").unwrap(), 255);
+        assert!(parse_uint::<u8>(b" 256", "ge").is_err(), "u8 overflow");
+        // Negative into an unsigned target must not wrap.
+        assert!(parse_uint::<u32>(b"-1", "iri_key").is_err());
+        // Signed target still accepts negatives.
+        assert_eq!(parse_int::<i32>(b" -7", "units").unwrap(), -7);
     }
 }

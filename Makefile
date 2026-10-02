@@ -12,6 +12,9 @@ OUT     ?= data/lake
 FIXTURE_INPUT ?= data/raw/Year1/beer/beer_drug_1114_1165
 FIXTURE_OUTPUT := $(OUT)/bronze/iri_sales/year=1/category=beer/channel=drug
 
+# Input for `make sweep`. Override: make sweep SWEEP_FILE=data/raw/Year1/...
+SWEEP_FILE ?= $(FIXTURE_INPUT)
+
 # ---- Targets ---------------------------------------------------------------
 
 .PHONY: help
@@ -22,6 +25,7 @@ help:
 	@echo "  make clippy         Run cargo clippy --all-targets -- -D warnings"
 	@echo "  make test           Run cargo test"
 	@echo "  make bench          Run cargo bench (parser-only, slow)"
+	@echo "  make sweep          Sweep compression codecs on $(FIXTURE_INPUT)"
 	@echo "  make build          Release build of the CLI"
 	@echo "  make inventory      Walk $(IN) and print sales-file inventory"
 	@echo "  make validate       Validate a single file ($(FIXTURE_INPUT))"
@@ -46,6 +50,10 @@ test:
 .PHONY: bench
 bench:
 	$(BIN) bench --bench parse_sales -- --warm-up-time 2 --measurement-time 5
+
+.PHONY: sweep
+sweep:
+	$(BIN) run --release --example compression_sweep -- $(SWEEP_FILE)
 
 .PHONY: build
 build:

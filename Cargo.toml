@@ -76,3 +76,18 @@ strip = "symbols"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+
+# Sampling profilers need line tables, and `profile.bench` inherits
+# `strip = "symbols"` from the release profile above — so the shipped
+# and benchmark binaries have zero DWARF sections and one function
+# symbol (_main). Anything flamegraphing this crate must use this
+# profile; see BENCHMARKING.md § Profiling notes.
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
+# NOTE: also build with RUSTFLAGS="-C force-frame-pointers=yes". Cargo has
+# no profile key for frame pointers; setting it keeps `sample` stacks
+# unwindable. (It is not what fixes bad attribution here -- the 1.76x
+# inflation we first saw was inferno-collapse-sample dropping 43% of
+# samples. See BENCHMARKING.md § Profiling notes.)
