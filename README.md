@@ -180,7 +180,10 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 # Walk the input tree, validate every file, and ingest everything,
 # largest-first, skipping sources already covered by a successful
 # manifest record.
-iri-lake ingest-all --input data/raw --output-root data/lake --resume
+#
+# Skipping is the DEFAULT (no flag needed). Pass --overwrite to discard
+# existing outputs and rewrite them.
+iri-lake ingest-all --input data/raw --output-root data/lake
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
 iri-lake benchmark data/raw/Year1/beer/beer_drug_1114_1165 \
@@ -193,7 +196,9 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
 - `--batch-rows <N>` — rows buffered per flush (default 1 000 000)
 - `--row-group-rows <N>` — Parquet row-group target (default 4 000 000)
 - `--compression <codec>` — `zstd`, `zstd-1`, `zstd-3`, `zstd-9`,
-  `snappy`, `lz4`, `gzip`, `uncompressed` (default `zstd`)
+  `snappy`, `lz4`, `uncompressed` (default `zstd`)
+  (`gzip` is **not** available: the `parquet` dependency is built without
+  the `flate2` feature, so requesting it fails at runtime.)
 - `--worker-threads <N>` — defaults to logical CPU count, capped at 16
 
 ## Resume semantics
@@ -236,6 +241,12 @@ crates, which is the dominant cost of the dependency graph.
   iri-lake ingest   data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
   iri-lake ingest   data/raw/Year1/beer/beer_drug_1114_1165   # should SKIP
   ```
+
+- The staged, gated sequence for the **full 143 GB corpus** — inventory,
+  full validation sweep, widening ramp, and the reconciliation queries
+  that decide whether the lake is trustworthy — is in
+  [`docs/corpus_readiness.md`](docs/corpus_readiness.md). Read it before
+  the all-corpus run; it also lists the known gaps that gate that run.
 
 - Then move to **one category** (`--category beer`) and then to a
   full dry-run (`ingest-all --dry-run --max-files 5`) before

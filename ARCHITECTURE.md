@@ -340,3 +340,9 @@ bandwidth, and NVMe queue depth simultaneously. The bench harness
 in `benches/parse_sales.rs` measures the per-file pipeline; once
 that is profiled on a representative file, parallel ingestion across
 files is the right next optimisation.
+
+> **Status: not implemented.** `rayon` is a dependency but `ingest-all`
+> still iterates files sequentially, and its `--workers` flag is parsed and
+> discarded. This is tracked as gap G1 in
+> [`docs/corpus_readiness.md`](docs/corpus_readiness.md), which also holds
+> the gated plan for the first full 143 GB corpus run.
