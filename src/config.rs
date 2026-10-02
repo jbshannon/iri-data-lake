@@ -31,6 +31,11 @@ pub struct IngestConfig {
     /// filename's declared range. Disable for full-corpus runs where
     /// mismatches are known to be absent.
     pub week_range_strict: bool,
+    /// Minimum age, in hours, a `*.tmp` file under the output root must
+    /// reach before the automatic pre-run cleanup deletes it (G5). The
+    /// age gate keeps the sweep from deleting a `.tmp` that a concurrent
+    /// run is still writing.
+    pub tmp_max_age_hours: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -68,6 +73,7 @@ impl IngestConfig {
             overwrite: OverwriteMode::Refuse,
             unknown_feature: UnknownFeaturePolicy::Fail,
             week_range_strict: false,
+            tmp_max_age_hours: crate::cleanup::DEFAULT_TMP_MAX_AGE.as_secs() / 3600,
         }
     }
 
@@ -112,6 +118,9 @@ impl IngestConfig {
         if let Some(u) = overrides.unknown_feature {
             self.unknown_feature = u;
         }
+        if let Some(h) = overrides.tmp_max_age_hours {
+            self.tmp_max_age_hours = h;
+        }
         self
     }
 }
@@ -126,6 +135,7 @@ pub struct ConfigOverrides {
     pub output_root: Option<PathBuf>,
     pub overwrite: Option<OverwriteMode>,
     pub unknown_feature: Option<UnknownFeaturePolicy>,
+    pub tmp_max_age_hours: Option<u64>,
 }
 
 fn num_cpus() -> usize {
@@ -142,6 +152,7 @@ mod tests {
     #[test]
     fn defaults_are_sane() {
         let c = IngestConfig::defaults();
+        assert_eq!(c.tmp_max_age_hours, 24);
         assert_eq!(c.batch_rows, 1_000_000);
         assert_eq!(c.parquet_row_group_rows, 4_000_000);
         assert_eq!(c.compression, "zstd");

@@ -15,6 +15,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod arrow_output;
+pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod discovery;

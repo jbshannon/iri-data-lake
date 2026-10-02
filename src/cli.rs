@@ -38,6 +38,12 @@ pub struct Cli {
     /// Input root for source files. Defaults to `data/raw`.
     #[arg(long, global = true, env = "IRI_LAKE_INPUT_ROOT")]
     pub input_root: Option<PathBuf>,
+    /// Minimum age in hours a stale `*.tmp` file under the output root
+    /// must reach before the pre-run cleanup deletes it. `0` removes
+    /// every `*.tmp`, which is only safe when no other run shares the
+    /// output root.
+    #[arg(long, global = true, env = "IRI_LAKE_TMP_MAX_AGE_HOURS")]
+    pub tmp_max_age_hours: Option<u64>,
 
     #[command(subcommand)]
     pub cmd: Cmd,
@@ -143,6 +149,7 @@ impl Cli {
         cfg.worker_threads = self.worker_threads.or(cfg.worker_threads);
         cfg.input_root = self.input_root.clone().unwrap_or(cfg.input_root);
         cfg.output_root = self.output_root.clone().unwrap_or(cfg.output_root);
+        cfg.tmp_max_age_hours = self.tmp_max_age_hours.unwrap_or(cfg.tmp_max_age_hours);
         cfg
     }
 

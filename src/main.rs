@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use iri_lake::cleanup::{cleanup_stale_tmp, CleanupReport};
 use iri_lake::cli::{Cli, Cmd, OutputFormat};
 use iri_lake::discovery;
 use iri_lake::errors::IngestError;
@@ -84,6 +85,7 @@ fn run(cli: Cli) -> Result<()> {
             resume: _,
         } => {
             let out = output_root.unwrap_or_else(|| config.output_root.clone());
+            let _ = sweep_tmp(&out, &config);
             let started = Instant::now();
             let outcome = ingest_file(
                 &path,
@@ -181,6 +183,8 @@ fn run(cli: Cli) -> Result<()> {
                 return Ok(());
             }
 
+            let _ = sweep_tmp(&out_root, &config);
+
             let mut completed = 0usize;
             let mut skipped = 0usize;
             let mut failed = 0usize;
@@ -244,6 +248,35 @@ fn run(cli: Cli) -> Result<()> {
             run_benchmark(&path, &cfg, repeats)
         }
     }
+}
+
+/// Delete stale `*.tmp` leftovers under `output_root` before a run
+/// writes anything (G5). Interrupted runs leave a `.tmp` sibling with
+/// no manifest line, so nothing else would ever reap them.
+///
+/// Best-effort by design: a failure here is reported but does not stop
+/// the ingest, because the files are inert leftovers. The age gate in
+/// `cleanup` means a concurrent run's in-flight `.tmp` is never a
+/// candidate.
+fn sweep_tmp(output_root: &Path, config: &iri_lake::config::IngestConfig) -> CleanupReport {
+    let report = cleanup_stale_tmp(
+        output_root,
+        std::time::Duration::from_secs(config.tmp_max_age_hours * 3600),
+    );
+    if !report.is_empty() {
+        tracing::info!(
+            output_root = %output_root.display(),
+            "{}",
+            report.summary()
+        );
+        for (path, err) in &report.failures {
+            tracing::warn!(path = %path.display(), error = %err, "tmp cleanup failed");
+        }
+        for path in &report.removed {
+            tracing::debug!(path = %path.display(), "removed stale tmp");
+        }
+    }
+    report
 }
 
 fn print_inventory_table(inv: &discovery::Inventory) {

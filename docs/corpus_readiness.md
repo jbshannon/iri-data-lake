@@ -1,8 +1,10 @@
 # Corpus readiness — running the full IRI corpus
 
 Status: **mostly plan.** This document changes no behaviour, but it did
-surface one bug (gap G2), fixed in the same branch: `--resume` and
-`--overwrite` were inert. The rest are records and proposals. The point is
+surface two bugs, both fixed in the same branch: G2 (`--resume` and
+`--overwrite` were inert) and G8 (a broken `make fixtures` target), plus
+the G5 leftover-cleanup gap, now automatic. The rest are records and
+proposals. The point is
 that the first all-corpus ingest is a *gated* operation rather than an
 exploratory one.
 
@@ -29,10 +31,10 @@ another worktree or a decision that has not been made yet.
 | G2 | **Fixed on `planning`.** `--resume`/`--overwrite` were parsed but never reached the ingest path: `Cli::overwrite_mode` was never called and `config.overwrite` was never read, so `OverwriteMode` was dead code and `skip_decision` alone drove the skip. `--overwrite` silently skipped; `--resume --overwrite` resolved silently. Now wired through and covered by tests. | — | closed |
 | G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. **Decision: keep as-is** — failing loudly on an unexpected `F` token is the right default for a bronze layer, and the manifest records the failure so the run stays resumable. Revisit only if the real corpus turns out to contain such tokens. | accepted |
 | G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | **Decision: defer.** Assume filename week ranges are recorded correctly for now; add a catch later once testing gives evidence about whether that assumption holds. §5's per-year week-range query stays as a cheap corpus-wide backstop. | deferred |
-| G5 | `ManifestStatus::InProgress` exists but is never written. | No crash-safe "this file was being written" record. An interrupted run leaves a `.tmp` sibling and no manifest line, so the file is simply re-ingested next pass. Correct, but it means **`*.tmp` files under `data/lake` are the marker of an interrupted run**, and nothing cleans them automatically. | operator step (§4) |
+| G5 | **Fixed on `planning`.** `ManifestStatus::InProgress` is still never written, but the consequence — unattended `*.tmp` leftovers under `data/lake` — is now handled automatically. `src/cleanup.rs` sweeps `*.tmp` files under the output root at the start of every `ingest` / `ingest-all` (before anything is written) and deletes those older than 24 h (`--tmp-max-age-hours`, `IRI_LAKE_TMP_MAX_AGE_HOURS`). The age gate means a concurrent run's in-flight `.tmp` is never a candidate; failures are logged, never fatal. `make clean-tmp` runs the same sweep by hand. | — | closed |
 | G6 | `manifest.jsonl` is append-only and `last_for_path` re-reads the whole file per lookup. | O(records²) per run. At 744 records × a few passes this is seconds, not a problem. Not worth changing before the corpus run; would matter at ~10⁵ sources. | none |
 | G7 | **False alarm — corrected.** `data/raw` is a symlink to `~/.julia/dev/IRIData/data/IRI/Raw` and resolves fine; the corpus is staged and measures 140.85 GiB / 744 files / 2.69 B rows. An earlier draft of this table claimed the symlink was "dangling" on the strength of `du -sh data/raw` reporting 0 B. That command reports the *symlink itself*; it does not follow the link. Use `du -shL` or a trailing slash. | none | closed |
-| G8 | `make fixtures` runs `cargo test --test fixtures_emit`, and there is no `tests/fixtures_emit.rs`. | Target fails. Harmless to a corpus run, but it is a broken target in the documented workflow. | trivial fix |
+| G8 | **Fixed on `planning`.** `make fixtures` ran `cargo test --test fixtures_emit`, and there is no `tests/fixtures_emit.rs`. There is also nothing to emit: `tests/common/mod.rs` builds every fixture into a fresh tempdir at test time and no binaries are committed. The target and its help line are removed; `make test` is the entry point. | — | closed |
 
 ### The one that actually matters
 
@@ -172,12 +174,25 @@ If a run is interrupted, in order of preference:
 
 1. Re-run the identical command. Completed files skip, incomplete files
    restart.
-2. Delete stray `*.tmp` siblings under `$OUT` before re-running. They are
-   inert leftovers (G5) but they accumulate and they confuse anyone
-   globbing `data/lake`.
+2. Nothing else is required. `ingest` and `ingest-all` sweep stale
+   `*.tmp` leftovers under the output root before they write anything,
+   so the debris from a killed run is reaped automatically. Only
+   leftovers older than `--tmp-max-age-hours` (default 24 h) are
+   removed, which protects a `.tmp` that a *concurrent* run is still
+   writing.
+
+To sweep by hand, without starting a run:
 
 ```bash
-find $OUT -name '*.tmp' -print -delete
+make clean-tmp                                   # same policy, via find
+cargo run --release -- ingest-all --input data/raw \
+  --output-root data/lake --dry-run              # does NOT clean; dry-run writes nothing
+```
+
+```bash
+# What the automatic sweep does, for inspection:
+find $OUT -name '*.tmp' -print -delete            # unconditional: only when
+                                                  # no other run shares $OUT
 ```
 
 ## 5. Gate 4 — the full run, and Gate 5 — reconciliation
@@ -237,7 +252,8 @@ file-count tolerance, 5d is all zeros, and 5e's per-year week ranges match
 - [ ] Gate 4 full run complete, log archived
 - [ ] Gate 5 queries 5a–5e run and pasted into the run log
 - [ ] README compression list corrected against the enabled Parquet codecs
-- [ ] `make fixtures` fixed or removed
+- [x] G5 automatic `*.tmp` cleanup (`src/cleanup.rs`, wired into ingest paths)
+- [x] `make fixtures` removed — it referenced a test that never existed
 
 ## 7. Decisions and open questions
 
