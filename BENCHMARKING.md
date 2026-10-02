@@ -54,15 +54,31 @@ BENCH_FILE=data/raw/Year1/beer/beer_drug_1114_1165 \
 ```
 
 `iri-lake benchmark <path>` is the CLI mirror — same idea, fewer
-bells and whistles, and writes JSON to stdout for plotting.
+bells and whistles, and writes JSON to stdout for plotting. Each repeat
+runs against a fresh scratch output root so the manifest's idempotence
+guard can't silently skip repeats 2..N; the report carries a
+median/best/worst summary because repeat 0 always pays for a cold page
+cache (~3% slower in our measurements).
+
+`cargo run --release --example compression_sweep -- <file>` sweeps the
+codec axis specifically. It reports write time, output size and — the
+part that matters for a lakehouse — **decode** time for each codec.
 
 ## Knobs to sweep
 
 | knob | values to try |
 |---|---|
 | `batch_rows` | 250 000, 1 000 000, 4 000 000, 8 000 000 |
-| compression | `uncompressed`, `snappy`, `zstd-1`, `zstd-3`, `zstd-9` |
+| compression | `uncompressed`, `snappy`, `lz4`, `lz4_raw`, `zstd-1`, `zstd-3`, `zstd-9` |
 | row-group rows | 1 000 000, 4 000 000, 8 000 000, 16 000 000 |
+
+`gzip` was removed as an option. It was accepted by `IngestConfig` but
+the `parquet` crate is built without its `flate2` feature, so it failed
+at write time with `Disabled feature at compile time: flate2` — a panic
+mid-write rather than a usable default. It now falls through to the
+unknown-codec path and warns. Do not re-add it without enabling
+`flate2` in `Cargo.toml` **and** re-measuring: it is slower than zstd at
+every level we tested and has no offsetting advantage.
 
 For a representative corpus the defaults in `IngestConfig::defaults()`
 are:
@@ -73,9 +89,11 @@ parquet_row_group_rows= 4_000_000
 compression           = zstd
 ```
 
-These are **not** claimed to be optimal. They are starting points
-that a) fit in a typical Arrow batch, b) keep per-file Arrow memory
-under 50 MB, and c) exploit Zstd's sweet spot on numeric columns.
+These are **not** claimed to be optimal. The codec default has since been
+*confirmed* by measurement (see below); `batch_rows` remains a starting
+point that a) fits in a typical Arrow batch, b) keeps per-file Arrow
+memory under 50 MB, and c) happens to be a good size/throughput
+compromise.
 
 ## What to measure
 
@@ -98,17 +116,101 @@ instead.
 
 ## Reading the numbers
 
-A representative table on a 2024 MacBook Pro (M-series, NVMe):
+### Measured phase split
 
-| phase | file size | rows | batch | codec | raw MiB/s | rows/s | out bytes | ratio |
-|---|---:|---:|---:|---|---:|---:|---:|---:|
-| parse_only | 36 MB | 660 k | — | — | 700 | 12 M | — | — |
-| parse_and_arrow | 36 MB | 660 k | 1 M | — | 250 | 4 M | — | — |
-| parse_and_parquet | 36 MB | 660 k | 1 M | snappy | 130 | 2 M | 11 MB | 3.3× |
-| parse_and_parquet | 36 MB | 660 k | 1 M | zstd-3 | 110 | 1.7 M | 8 MB | 4.5× |
+Apple M1 (8 cores, 16 GiB, APFS NVMe), `beer_drug_1114_1165`
+(35.3 MiB / 660 096 rows), single-threaded, hot cache, Criterion
+`benches/parse_sales.rs`:
 
-(Fill these in with your own machine. The point is the comparison,
-not the absolute numbers.)
+| phase | time | Mrows/s | raw MiB/s | share |
+|---|---:|---:|---:|---:|
+| parse_only | 81.4 ms | 8.11 | 433 | 52 % |
+| parse_and_arrow | 81.3 ms | 8.12 | 434 | — |
+| parse_and_parquet | 157.4 ms | 4.19 | 224 | 48 % |
+
+Read this as: **Arrow `RecordBatch::try_new` is free** (−0.1 %, inside
+noise), and Parquet encode+compress is 76.0 ms of a 157.4 ms run. The
+bottleneck is split almost exactly in half between parsing and Parquet,
+so neither phase alone justifies a rewrite. Optimise Parquet only if you
+also raise `worker_threads`; optimise the parser only if you have
+already made the writer free.
+
+### Measured codec sweep
+
+`compression_sweep` on `toothpa_groc_1114_1165` (304.0 MiB /
+5 691 705 rows), median of 3, production batch/row-group defaults:
+
+| codec | write MiB/s | decode ms | size MiB | B/row |
+|---|---:|---:|---:|---:|
+| uncompressed | 563.0 | 108.8 | 27.26 | 5.02 |
+| snappy | 523.3 | 124.6 | 22.17 | 4.08 |
+| lz4 | 519.6 | 115.7 | 22.19 | 4.09 |
+| lz4_raw | 520.4 | 117.5 | 22.19 | 4.09 |
+| **zstd** (= `zstd-1`) | **500.0** | 138.8 | **18.82** | **3.47** |
+| zstd-3 | 460.4 | 142.1 | 17.87 | 3.29 |
+| zstd-9 | 283.1 | 141.7 | 17.49 | 3.22 |
+
+Three things this settles:
+
+1. **The codec is nearly free; the encoding is the whole story.** zstd-1
+   costs 11 % write throughput versus *uncompressed* (500 vs 563 MiB/s)
+   and buys 31 % smaller files. Most of the compression ratio comes from
+   Parquet's dictionary + RLE/bit-packing encoding layer, which is always
+   on — a truly `UNCOMPRESSED` file still measures 5.02 B/row, verified
+   by reading the footer codec. **Never report the headline ratio as
+   "compression"; most of it is encoding.**
+2. **`lz4` buys nothing over `snappy`** — identical sizes to two decimal
+   places, marginally faster write, ~7 % slower decode.
+3. **`zstd` (the default) means level 1**, not level 3 — `zstd` and
+   `zstd-1` produce byte-identical output. Don't assume otherwise.
+
+### Measured file-size scaling
+
+End-to-end `iri-lake benchmark`, median of 3, warm cache. "wall" is total
+process time including SHA-256; "ingest" is the `IngestStats` timer,
+which starts after hashing.
+
+| file | MiB | rows | ingest MiB/s | wall MiB/s | wall Mrows/s |
+|---|---:|---:|---:|---:|---:|
+| beer_drug | 35.3 | 660 k | 222 | 133 | 2.48 |
+| shamp_drug | 79.1 | 1.48 M | 220 | 132 | 2.47 |
+| toothpa_groc | 304.0 | 5.69 M | 233 | 136 | 2.55 |
+| fzdinent_groc | 765.3 | 14.3 M | 227 | 137 | 2.56 |
+
+Throughput is flat from 35 MiB to 765 MiB — this is a **per-row** bound,
+not a per-file or per-batch overhead, so there is nothing to gain from
+batching fewer, larger files.
+
+### Whole-corpus extrapolation
+
+Corpus is 744 files / 140.85 GiB / 2 689 259 921 rows (`inventory`).
+
+| basis | rate | time |
+|---|---:|---:|
+| by bytes | 136.9 MiB/s wall | 1 053 s |
+| by rows | 2.55 Mrows/s wall | 1 054 s |
+
+> **≈ 18 minutes single-threaded**, producing ≈ 8.5 GiB of Parquet.
+
+Both bases agree to 0.1 %, so the estimate is not sensitive to the
+row-weighting of the corpus. It is a **lower bound**: `ingest-all`
+defaults to `worker_threads = num_cpus()`, which this sweep never
+exercised. Expect roughly 3–5 min at 4–6× scaling, but treat that as an
+inference until someone times `ingest-all` end to end.
+
+`batch_rows` was swept on the 765 MiB file and moves throughput by <1 %
+(noise) while moving output size by ~9 %:
+
+| batch_rows | MiB/s | out MiB | ratio |
+|---:|---:|---:|---:|
+| 250 k | 230.5 | 44.27 | 17.29× |
+| 1 M (default) | 233.0 | 46.07 | 16.61× |
+| 4 M | 231.2 | 48.37 | 15.82× |
+| 8 M | 231.1 | 48.37 | 15.82× |
+
+(4 M and 8 M are identical because `parquet_row_group_rows` defaults to
+4 M and caps the row group regardless of batch size.) If storage matters
+more than RAM, 250 k buys 9 % smaller files for no throughput cost.
 
 Look for:
 
@@ -120,6 +222,55 @@ Look for:
   compress-bound. Switch to `lz4` or split across cores.
 - **All phases slow AND low CPU** → I/O bound. Check NVMe queue depth
   and that the input file is on local storage (not network mount).
+
+## Rejected: writing Arrow IPC (`.arrow` / Feather) instead of Parquet
+
+Worth recording so nobody re-litigates it from first principles.
+Streaming the `RecordBatch`es straight to an Arrow IPC file skips the
+Parquet encode+compress entirely. Measured on the same parsed batch:
+
+| format | write ms | output | B/row |
+|---|---:|---:|---:|
+| Arrow IPC | **6.7** | 19.83 MiB | 31.5 |
+| Parquet (zstd-3) | 80.3 | 2.43 MiB | 3.86 |
+| Parquet (uncompressed) | 65.9 | 3.76 MiB | 5.97 |
+
+*(`beer_drug_1114_1165`, 660 096 rows.)*
+
+The write step really is ~12× faster, and it is *not* a good trade:
+
+- **8.2× the bytes.** 31.5 B/row vs 3.86. Extrapolated to the corpus
+  that is **~79 GiB of IPC vs ~8.5 GiB of Parquet** for identical data.
+- **The end-to-end win is only 1.82×**, because parsing is unchanged
+  and is now the larger half. On cold storage the win shrinks further,
+  since IPC becomes I/O-bound pushing 8× more bytes.
+- **It breaks the product.** DuckDB cannot read Arrow IPC, so every
+  scan-validation query below, hive partitioning, predicate pushdown
+  and row-group sizing stop working.
+
+If ingest throughput ever has to be maximised, raising
+`worker_threads` is the better lever: it helps both halves and keeps
+Parquet.
+
+## Harness traps
+
+Both of these cost real time to diagnose; check here first.
+
+- **`IngestConfig::for_test()` in a benchmark measures the wrong thing.**
+  It sets `parquet_row_group_rows = 1024`, so a "benchmark" wrote one
+  row group per 1024 rows — 645 tiny row groups for `beer_drug` instead
+  of one. It inflated `parse_and_parquet` by **33 %** (236 ms → 157 ms
+  once fixed) and made it look as though Parquet cost far more than it
+  does. `benches/parse_sales.rs` now starts from `IngestConfig::defaults()`
+  and only overrides what it intends to sweep. `for_test()` remains
+  correct for unit tests, where tiny row groups are harmless.
+- **The manifest's idempotence guard silently eats benchmark repeats.**
+  `ingest_file` returns `Skipped` when a prior success matches the
+  source hash and config, so `--repeats 3` used to measure once and emit
+  two `{"skipped": true}` entries that looked like data. `run_benchmark`
+  now gives each repeat a fresh scratch output root and treats `Skipped`
+  as a hard error. Any future benchmark that shells out to `ingest_file`
+  needs the same isolation.
 
 ## Scan validation with DuckDB
 
@@ -185,11 +336,37 @@ When the headline number isn't good enough, drill in:
 
 ## Things we *intend* to leave slow
 
-- SHA-256 over each source file before parsing. Cost is one streaming
-  pass at ~1 GB/s on a single core; not worth skipping for the
-  idempotence guarantee.
-- Zstd level 9. The level-3 → level-9 compression gain is ~5% but
-  the cost is ~5×; do not enable by default.
+- **Zstd level 9.** Measured on `toothpa_groc`: 1.8× slower to write
+  than `zstd-1` (283 vs 500 MiB/s) for 1.4 % smaller files, and *no*
+  faster to decode (141.7 vs 138.8 ms). It loses on both axes. Note
+  that `zstd-3` is also a poor trade — 8 % slower write for 5 % smaller
+  files. The default `zstd` (level 1) is the sweet spot.
+- **The 7-char `str::from_utf8 + trim + parse` chain** (see below).
+
+### SHA-256 is *not* one of these — it is the largest single cost
+
+The older estimate of "~1 GB/s on a single core" was wrong by ~3×.
+Measured with `shasum -a 256` on the 765 MiB `fzdinent_groc`:
+
+| stage | time | MiB/s | % of wall |
+|---|---:|---:|---:|
+| read file (warm) | 0.06 s | 12 700 | 1 % |
+| **SHA-256** | **2.48 s** | **308** | **44 %** |
+| parse + Arrow + Parquet | 3.37 s | 227 | 55 % |
+
+`IngestStats::elapsed` starts *after* hashing (`ingest.rs`), so the
+`raw_MiB_s` / `rows_s` fields it reports **exclude** SHA-256 and manifest
+I/O. Comparing them against wall-clock is a reliable way to convince
+yourself hashing is free. It is not: it is the single largest item in
+the pipeline, and the ingest is still compute-bound long after disk I/O
+stops mattering (0.06 s to re-read the file).
+
+If ingest throughput ever becomes the goal, dropping or parallelising
+the hash is the single biggest win available — it would roughly halve
+end-to-end time. We keep it because the idempotence guarantee is worth
+more than 2× on a job that runs once per corpus, but that is a product
+decision, not a performance one, and should be re-litigated if the
+guarantee is ever in question.
 
 ## Things that look slow but are not
 
