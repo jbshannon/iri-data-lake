@@ -317,39 +317,96 @@ fn print_validation(r: &iri_lake::validation::ValidationReport) {
     println!("sample_passed:  {}/{}", r.sample_passed, r.sample_size);
 }
 
+/// Benchmark a single ingest of `path`, `repeats` times.
+///
+/// Each repeat writes to a *fresh* temporary output root. That is
+/// deliberate: `ingest_file` consults the manifest and returns
+/// `IngestOutcome::Skipped` when a prior success record matches the
+/// source hash and the current config. That idempotence guard is exactly
+/// what we want for `ingest`/`ingest-all`, but it makes repeats 2..N
+/// silently measure nothing. Isolating the output root per repeat keeps
+/// the measurement honest without weakening the guard itself.
+///
+/// The temporary root is removed on drop, so benchmarking never
+/// pollutes the configured `--output-root`.
 fn run_benchmark(path: &Path, cfg: &iri_lake::config::IngestConfig, repeats: usize) -> Result<()> {
-    use std::time::Instant;
+    anyhow::ensure!(repeats >= 1, "--repeats must be at least 1");
+
+    let scratch = tempfile::tempdir()
+        .context("create scratch output root for benchmark")?;
+
     let mut measurements: Vec<serde_json::Value> = Vec::new();
     for i in 0..repeats {
+        let repeat_root = scratch.path().join(format!("run-{i}"));
         let started = Instant::now();
         let outcome = ingest_file(
             path,
             &cfg.input_root,
-            &cfg.output_root,
+            &repeat_root,
             cfg,
             &IngestFilter::default(),
         )?;
         let elapsed = started.elapsed();
-        let entry = match outcome {
-            IngestOutcome::Completed(_, stats) => serde_json::json!({
-                "repeat": i,
-                "rows": stats.written_rows,
-                "bytes_in": stats.source_size_bytes,
-                "bytes_out": stats.output_bytes,
-                "elapsed_s": elapsed.as_secs_f64(),
-                "raw_MiB_s": stats.raw_mib_per_second(),
-                "rows_s": stats.rows_per_second(),
-                "compression_ratio": stats.compression_ratio(),
-                "batch_rows": cfg.batch_rows,
-                "compression": cfg.compression,
-            }),
-            IngestOutcome::Skipped(_) => serde_json::json!({
-                "repeat": i,
-                "skipped": true,
-            }),
+        let stats = match outcome {
+            IngestOutcome::Completed(_, stats) => stats,
+            IngestOutcome::Skipped(_) => {
+                // Each repeat gets a private output root, so the manifest
+                // should be empty and this branch unreachable. Fail loudly
+                // rather than emit a `"skipped": true` entry that would be
+                // silently averaged as a measurement.
+                anyhow::bail!(
+                    "repeat {i} was skipped by the manifest; \
+                     this is a benchmark-harness bug, not a measurement"
+                );
+            }
         };
-        measurements.push(entry);
+        measurements.push(serde_json::json!({
+            "repeat": i,
+            "rows": stats.written_rows,
+            "bytes_in": stats.source_size_bytes,
+            "bytes_out": stats.output_bytes,
+            "elapsed_s": elapsed.as_secs_f64(),
+            "raw_MiB_s": stats.raw_mib_per_second(),
+            "rows_s": stats.rows_per_second(),
+            "compression_ratio": stats.compression_ratio(),
+            "batch_rows": cfg.batch_rows,
+            "row_group_rows": cfg.parquet_row_group_rows,
+            "compression": cfg.compression,
+        }));
     }
-    println!("{}", serde_json::to_string_pretty(&measurements)?);
+
+    // The first repeat pays for cold page cache; the median of the
+    // repeats is the headline number, the best is the least-noisy upper
+    // bound. Both are emitted so callers can plot the spread.
+    let perfs: Vec<f64> = measurements
+        .iter()
+        .map(|m| m["raw_MiB_s"].as_f64().unwrap_or_default())
+        .collect();
+    let mut sorted = perfs.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.is_empty() {
+        f64::NAN
+    } else {
+        sorted[sorted.len() / 2]
+    };
+
+    let report = serde_json::json!({
+        "file": path.display().to_string(),
+        "bytes_in": measurements
+            .first()
+            .and_then(|m| m["bytes_in"].as_u64())
+            .unwrap_or(0),
+        "rows": measurements
+            .first()
+            .and_then(|m| m["rows"].as_u64())
+            .unwrap_or(0),
+        "repeats": measurements,
+        "summary": {
+            "raw_MiB_s_median": median,
+            "raw_MiB_s_best": sorted.last().copied().unwrap_or(f64::NAN),
+            "raw_MiB_s_worst": sorted.first().copied().unwrap_or(f64::NAN),
+        },
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
