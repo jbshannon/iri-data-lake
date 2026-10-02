@@ -27,8 +27,8 @@ another worktree or a decision that has not been made yet.
 |---|---|---|---|
 | G1 | `ingest-all` processes files **sequentially** in a `for` loop (`src/main.rs:187`); `rayon` is a declared dependency but unused. The `--workers` flag is destructured as `workers: _` and discarded. | The full corpus runs at single-file speed. Wall time = sum of per-file times, so no overlap of I/O with compression. | benchmarking / follow-up |
 | G2 | **Fixed on `planning`.** `--resume`/`--overwrite` were parsed but never reached the ingest path: `Cli::overwrite_mode` was never called and `config.overwrite` was never read, so `OverwriteMode` was dead code and `skip_decision` alone drove the skip. `--overwrite` silently skipped; `--resume --overwrite` resolved silently. Now wired through and covered by tests. | — | closed |
-| G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. On 744 files this is the single most likely cause of a partial run. | needs decision |
-| G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | A file whose rows disagree with its filename week range will ingest silently as wrong data. The reconciliation queries in §5 are the only backstop. | needs decision |
+| G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. **Decision: keep as-is** — failing loudly on an unexpected `F` token is the right default for a bronze layer, and the manifest records the failure so the run stays resumable. Revisit only if the real corpus turns out to contain such tokens. | accepted |
+| G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | **Decision: defer.** Assume filename week ranges are recorded correctly for now; add a catch later once testing gives evidence about whether that assumption holds. §5's per-year week-range query stays as a cheap corpus-wide backstop. | deferred |
 | G5 | `ManifestStatus::InProgress` exists but is never written. | No crash-safe "this file was being written" record. An interrupted run leaves a `.tmp` sibling and no manifest line, so the file is simply re-ingested next pass. Correct, but it means **`*.tmp` files under `data/lake` are the marker of an interrupted run**, and nothing cleans them automatically. | operator step (§4) |
 | G6 | `manifest.jsonl` is append-only and `last_for_path` re-reads the whole file per lookup. | O(records²) per run. At 744 records × a few passes this is seconds, not a problem. Not worth changing before the corpus run; would matter at ~10⁵ sources. | none |
 | G7 | **False alarm — corrected.** `data/raw` is a symlink to `~/.julia/dev/IRIData/data/IRI/Raw` and resolves fine; the corpus is staged and measures 140.85 GiB / 744 files / 2.69 B rows. An earlier draft of this table claimed the symlink was "dangling" on the strength of `du -sh data/raw` reporting 0 B. That command reports the *symlink itself*; it does not follow the link. Use `du -shL` or a trailing slash. | none | closed |
@@ -239,18 +239,29 @@ file-count tolerance, 5d is all zeros, and 5e's per-year week ranges match
 - [ ] README compression list corrected against the enabled Parquet codecs
 - [ ] `make fixtures` fixed or removed
 
-## 7. Open questions
+## 7. Decisions and open questions
 
-1. **G3, unexpected `F` tokens.** Fail the file (current), or accept with
-   `WarnAndTreatAsUnknown` and quarantine the rows? This needs an answer
-   *before* the full run, because it changes whether the run can complete
-   unattended.
-2. **G4, week-range strictness.** Turn `week_range_strict` on for the
-   corpus? It would catch mis-named files that currently pass silently, at
-   the cost of a per-row check the parser was built to avoid.
+### Decided
+
+1. **G3, unexpected `F` tokens — keep `Fail` as-is.** No change. Failing
+   loudly is the right default for a bronze layer, and because the failure
+   is recorded in the manifest the run stays resumable. Revisit only if the
+   real corpus turns out to contain such tokens, in which case
+   `WarnAndTreatAsUnknown` (already defined in `config.rs`, just not
+   reachable from the CLI) is the intended escape hatch.
+2. **G4, week-range strictness — defer.** Assume the filename week ranges
+   are correct. The enforcement mechanism exists (`week_range_strict`) but
+   is neither on nor CLI-reachable; leaving it off keeps the parser free of
+   a per-row check it was built to avoid. Add a catch later, once testing
+   gives evidence about whether the assumption actually holds.
+
+### Still open
+
 3. **G1, parallelism shape.** File-level rayon pool (as `ARCHITECTURE.md`
    sketches) versus one process per machine per shard of years. The
-   `benchmarking` worktree's numbers should decide.
+   `benchmarking` worktree's numbers should decide. This is the one gap
+   that gates the run schedule.
 4. **Failure policy for the full run.** Currently one bad file logs a
-   warning and the run continues. That is probably right, but it should be
-   an explicit decision rather than an emergent property of the loop.
+   warning and the run continues. That is probably right, and it composes
+   well with the G3 decision above, but it should be an explicit decision
+   rather than an emergent property of the loop.
