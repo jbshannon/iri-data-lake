@@ -50,6 +50,15 @@ impl MoneyError {
 ///
 /// The input slice is exactly the on-disk field bytes (typically 8 bytes).
 /// Whitespace (spaces) inside the slice is ignored.
+///
+/// Returns `Result<i64, MoneyError>` because the IRI DOLLARS field is 8
+/// bytes wide and a parser that accepts "no decimal point" amounts (e.g.
+/// `parse_dollars_cents(b"9")`) implies a worst-case width-bound of
+/// `$99 999 999 = 9 999 999 900` cents, which exceeds `i32::MAX`. We
+/// keep the result in `i64` to match the storage type in the canonical
+/// schema (`dollars_cents: Int64`). Empirical observation of the corpus
+/// would let us tighten to `Int32` (realistic max cents is well under
+/// 10⁶); see `ARCHITECTURE.md` for the analysis.
 pub fn parse_dollars_cents(field: &[u8]) -> Result<i64, MoneyError> {
     let mut had_dot = false;
     let mut int_part: i64 = 0;

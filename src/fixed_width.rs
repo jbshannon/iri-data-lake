@@ -182,6 +182,36 @@ pub fn expected_rows(file_size: u64) -> Option<u64> {
     Some(body / RECORD_LEN as u64)
 }
 
+/// Field-width → max integer value.
+///
+/// All numeric columns in the IRI sales files store decimal digits with
+/// optional sign and optional decimal point (DOLLARS). The fixed width
+/// of the on-disk field therefore puts a hard upper bound on the
+/// representable value:
+/// - unsigned, W bytes: `0 ..= 10^W - 1`
+/// - signed,   W bytes: `-(10^W - 1) ..= 10^W - 1`
+/// - dollars,  W bytes with up to 2 fractional digits:
+///   `0 ..= (10^W - 1) * 100` cents
+///
+/// Use these bounds to pick the smallest Arrow integer type that can
+/// hold any value that could possibly fit on disk. Empirical
+/// observation can tighten further (e.g. if all IRI_KEY values are
+/// observed < 65 536), but width-based inference is deterministic
+/// and requires no scan.
+pub fn max_unsigned(width: usize) -> u64 {
+    let mut v: u64 = 1;
+    for _ in 0..width {
+        v = v.saturating_mul(10);
+    }
+    v.saturating_sub(1)
+}
+pub fn max_signed(width: usize) -> i64 {
+    max_unsigned(width) as i64
+}
+pub fn max_cents(width: usize) -> i64 {
+    (max_unsigned(width) as i64).saturating_mul(100)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +266,35 @@ mod tests {
         let known: &[u8] = b"IRI_KEY WEEK SY GE VEND  ITEM  UNITS DOLLARS  F    D PR";
         assert_eq!(HEADER_TEXT, known);
         assert_eq!(HEADER_TEXT.len(), 55);
+    }
+
+    #[test]
+    fn width_based_max_matches_field_layout() {
+        // IRI_KEY (7) max is 9_999_999 — fits UInt32, no UInt24 exists.
+        assert_eq!(max_unsigned(7), 9_999_999);
+        // WEEK (4) max is 9_999 — fits UInt16.
+        assert_eq!(max_unsigned(4), 9_999);
+        // SY/GE (2) max is 99 — fits UInt8.
+        assert_eq!(max_unsigned(2), 99);
+        // VEND/ITEM (5) max is 99_999 — exceeds UInt16 (65 535) so UInt32.
+        assert_eq!(max_unsigned(5), 99_999);
+        assert!(max_unsigned(5) > u16::MAX as u64);
+        // UNITS (5) signed max is ±99_999 — exceeds Int16 (32 767) so Int32.
+        assert_eq!(max_signed(5), 99_999);
+        assert!(max_signed(5) > i16::MAX as i64);
+        // DOLLARS (8) accepts "all integer digits" (no decimal point),
+        // so the worst-case width-bound is $99 999 999, i.e.
+        // 9 999 999 900 cents. That is > i32::MAX (~2.1 B) so Int64
+        // is the smallest correct storage type from width alone.
+        // (Empirically the corpus is well under $10k per row, so Int32
+        // would be safe; the scaffold is conservative.)
+        assert_eq!(max_cents(8), 9_999_999_900);
+        assert!(max_cents(8) > i32::MAX as i64);
+        // Upper-bound check is redundant (max_unsigned cannot exceed
+        // u64::MAX by construction), so just exercise the value:
+        let _: i64 = max_cents(8);
+        // D (1) max is 9 — fits UInt8. PR (1) is documented 0/1 only,
+        // so Boolean is appropriate but UInt8 always works.
+        assert_eq!(max_unsigned(1), 9);
     }
 }

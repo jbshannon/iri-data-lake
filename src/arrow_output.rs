@@ -40,9 +40,10 @@ pub fn schema() -> SchemaRef {
 /// Pre-allocated column builders sized to fit one batch in memory.
 ///
 /// Memory budget for a 1M-row batch (upper bound):
-/// - 7 × 4-byte ints           = 28 MB
-/// - 1 × 8-byte int (cents)    =  8 MB
-/// - 2 × 1-byte ints           =  2 MB
+/// - 6 × 4-byte ints           = 24 MB
+/// - 1 × 8-byte int (cents)    =  8 MB  (Int64; field width bounds max
+///   cents to 9_999_999_900, exceeds i32::MAX, so Int64 is required)
+/// - 4 × 1-byte ints           =  4 MB
 /// - 1 × 1-byte bool (bit-packed) ≈ 1 MB
 /// - 2 × variable string       ≈ 8 MB (low cardinality, dictionary-able)
 /// - Arrow validity/null bitmaps: 0 bytes (no nulls in this schema)
