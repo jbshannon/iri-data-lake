@@ -88,9 +88,32 @@ consulting the directory layout.
 | `feature_code` | `UInt8` | `F` (47–50), see below |
 | `display` | `UInt8` | `D` (52) |
 | `price_reduction` | `Boolean` | `PR` (54) |
-| `source_year` | `UInt8` | physical, from path |
 | `category` | `Utf8` | physical, from filename |
 | `channel` | `Utf8` | physical, from filename |
+
+`source_year` is **deliberately omitted** from the physical columns. The
+IRI `WEEK` field is a single integer counter (range 1114-1739 across the
+12 years, contiguous, non-overlapping) that maps to academic year
+1-12 via a deterministic function — see `fixed_width::week_to_year`.
+Year remains in the partition directory (`year=N/`) but is not duplicated
+inside every row. `category` and `channel` are still physical columns
+because they aren't derivable from the row content.
+
+### Type-tightening rules
+
+Each numeric Arrow type was chosen from the on-disk **byte width** of
+the field — see `fixed_width::max_unsigned`, `max_signed`, `max_cents`.
+The rule: W bytes of digits hold at most `10^W − 1`. Add the
+constraint that Arrow has no `UInt24`/`Int24`, so widths of 3-4 digits
+that overflow `UInt16`/`Int16` are forced up to `UInt32`/`Int32`.
+
+| field | width | max value | Arrow type | reason |
+|---|---:|---:|---|---|
+| `iri_key` | 7 | 9 999 999 | `UInt32` | no UInt24 |
+| `vend`, `item` | 5 | 99 999 | `UInt32` | UInt16 max 65 535 too small |
+| `units` | 5 | ±99 999 | `Int32` | Int16 max 32 767 too small |
+| `dollars_cents` | 8 | 9 999 999 900 | `Int64` | Int32 max 2.1 B too small (no-decimal worst case) |
+| `display` | 1 | 0-9 | `UInt8` | Boolean would need empirical 0/1 confirmation |
 
 ### Promotion-feature coding (`F`)
 

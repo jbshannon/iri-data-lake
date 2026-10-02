@@ -182,6 +182,47 @@ pub fn expected_rows(file_size: u64) -> Option<u64> {
     Some(body / RECORD_LEN as u64)
 }
 
+/// IRI academic-data year ranges derived from `docs/data_layout.md` §2.3.
+/// These are contiguous and non-overlapping, so `week → year` is a
+/// deterministic function over the full range.
+///
+/// The mapping is hard-coded rather than read from a dimension table
+/// because:
+///
+/// - The IRI WEEK field is a single integer counter (year 1 starts at
+///   week 1114, year 12 ends at week 1739, contiguous throughout).
+/// - The year ranges are stable across all 12 years of data.
+/// - A small `match` is faster than a table lookup and doesn't depend
+///   on a separate dimension-ingest pipeline.
+///
+/// Returns the academic year (1..=12) for any week in `1114..=1739`. `None`
+/// for week numbers outside the known range — those would indicate a
+/// file we haven't seen before.
+pub fn week_to_year(week: u16) -> Option<u8> {
+    // (start_week_inclusive, end_week_inclusive, academic_year)
+    // Source: devoirs/data_layout.md §2.3.
+    const RANGES: &[(u16, u16, u8)] = &[
+        (1114, 1165, 1),
+        (1166, 1217, 2),
+        (1218, 1269, 3),
+        (1270, 1321, 4),
+        (1322, 1373, 5),
+        (1374, 1426, 6), // 53-week year
+        (1427, 1478, 7),
+        (1479, 1530, 8),
+        (1531, 1582, 9),
+        (1583, 1634, 10),
+        (1635, 1686, 11),
+        (1687, 1739, 12), // 53-week year
+    ];
+    for &(lo, hi, y) in RANGES {
+        if (lo..=hi).contains(&week) {
+            return Some(y);
+        }
+    }
+    None
+}
+
 /// Field-width → max integer value.
 ///
 /// All numeric columns in the IRI sales files store decimal digits with
@@ -296,5 +337,22 @@ mod tests {
         // D (1) max is 9 — fits UInt8. PR (1) is documented 0/1 only,
         // so Boolean is appropriate but UInt8 always works.
         assert_eq!(max_unsigned(1), 9);
+    }
+
+    #[test]
+    fn week_to_year_is_total_on_known_range() {
+        // Every week in 1114..=1739 maps to exactly one year, and the
+        // ranges are contiguous (no gaps, no overlaps).
+        assert_eq!(week_to_year(1114), Some(1));
+        assert_eq!(week_to_year(1165), Some(1));
+        assert_eq!(week_to_year(1166), Some(2));
+        assert_eq!(week_to_year(1426), Some(6)); // last week of year 6
+        assert_eq!(week_to_year(1427), Some(7)); // first week of year 7
+        assert_eq!(week_to_year(1687), Some(12));
+        assert_eq!(week_to_year(1739), Some(12));
+        // Out-of-range weeks return None.
+        assert_eq!(week_to_year(1113), None);
+        assert_eq!(week_to_year(1740), None);
+        assert_eq!(week_to_year(0), None);
     }
 }

@@ -126,7 +126,7 @@ fn parses_default_fixture_into_arrow() {
     parse_records_into_builder(&id, body, 0, rows, &mut builders).unwrap();
     let batch = builders.finish(schema()).unwrap();
     assert_eq!(batch.num_rows(), 64);
-    assert_eq!(batch.num_columns(), 14);
+    assert_eq!(batch.num_columns(), 13);
 
     // Spot-check a few columns.
     let iri = batch
@@ -145,7 +145,7 @@ fn parses_default_fixture_into_arrow() {
         .downcast_ref::<arrow_array::BooleanArray>()
         .unwrap();
     let ch = batch
-        .column(13)
+        .column(12)
         .as_any()
         .downcast_ref::<arrow_array::StringArray>()
         .unwrap();

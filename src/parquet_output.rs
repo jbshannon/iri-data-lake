@@ -141,7 +141,6 @@ mod tests {
         b.feature_code.append_value(0);
         b.display.append_value(0);
         b.price_reduction.append_value(true);
-        b.source_year.append_value(1);
         b.category.append_value("c");
         b.channel.append_value("drug");
         b.iri_key.append_value(10);
@@ -155,7 +154,6 @@ mod tests {
         b.feature_code.append_value(1);
         b.display.append_value(1);
         b.price_reduction.append_value(false);
-        b.source_year.append_value(2);
         b.category.append_value("d");
         b.channel.append_value("groc");
         let batch: RecordBatch = b.finish(schema()).unwrap();

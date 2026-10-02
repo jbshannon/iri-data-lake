@@ -170,9 +170,60 @@ channel)`. We deliberately exclude `week` from the partition columns:
   splitting it across 52 partition directories would defeat the
   point of writing one file per source).
 
-`source_year`, `category`, and `channel` are also included as
-**physical columns** inside the Parquet file for the same reason:
-standalone files are self-describing, no directory lookup needed.
+`category` and `channel` are also included as **physical columns**
+inside the Parquet file so that standalone files are self-describing.
+
+`source_year` is **not** a physical column. The IRI `WEEK` field is a
+single integer counter (1114-1739 across the 12 years, contiguous,
+non-overlapping), so year is a deterministic function of week:
+
+```text
+1114-1165 -> 1   1166-1217 -> 2   1218-1269 -> 3   1270-1321 -> 4
+1322-1373 -> 5   1374-1426 -> 6   1427-1478 -> 7   1479-1530 -> 8
+1531-1582 -> 9   1583-1634 -> 10  1635-1686 -> 11  1687-1739 -> 12
+```
+
+The mapping is hard-coded as `fixed_width::week_to_year` rather than
+read from a dimension table, because the year ranges are stable across
+all 12 years of data and a `match` is faster than a table lookup. The
+partition directory still carries the year, so Hive-aware readers can
+read it via `hive_partitioning=true`. Standalone files (no directory
+context) compute year on demand via `week_to_year`.
+
+### Why this placement: Bronze vs Silver
+
+For `source_year` specifically:
+
+- The function `week -> year` is fully deterministic over the IRI
+  week range. It does not need to be stored as a Bronze dimension
+  table; a small `match` in code is enough.
+- Storing `source_year` as a physical column would be **redundant
+  data**: every row would carry a value derivable from another column
+  in the same row. The redundancy would let a mis-coded row exist
+  (a row where `week` says 1165 but `source_year` says 2), and would
+  cost a byte per row plus the encoding/decoding overhead.
+- The standard Hive pattern is to encode partition keys in the
+  directory layout only, not inside the row. DuckDB, Spark, Polars,
+  and PyArrow all support reading the partition columns from the
+  path. We follow that pattern.
+
+For the broader `week -> calendar_date` mapping (which IS not a pure
+function — the IRI academic week doesn't map cleanly to ISO calendar
+dates without the IRI Week Translation file):
+
+- **Bronze**: ingest the IRI Week Translation `.xls` as a small
+  reference table `iri_week_dimension`. It is itself data we capture
+  from the source — provenance is preserved by storing it raw at
+  Bronze rather than derived at Silver.
+- **Silver**: join the Bronze dimension to add a typed
+  `calendar_start_date` column to the sales fact. Year is *not* added
+  at Silver because it's a free function of week — we already have it
+  for the asking.
+
+The principle: **derive what is derivable, store what is captured**.
+A derived column at Silver is fine if the derivation requires a join
+to another Bronze table (e.g. calendar dates). A pure function does
+not need a Silver layer at all; it stays as code.
 
 ## Metadata & idempotence
 

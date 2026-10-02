@@ -111,7 +111,7 @@ fn parquet_round_trips_basic_schema() {
 
     // Channel string round-trip
     let ch = batch
-        .column(13)
+        .column(12)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
@@ -119,7 +119,9 @@ fn parquet_round_trips_basic_schema() {
         assert_eq!(ch.value(i), "drug");
     }
 
-    // source_year, feature_code, display, sy, ge, vend, item, week, category
+    // source_year is no longer a physical column; year is derivable
+    // from week (or read from the partition directory). Sy, feature_code,
+    // display, vend, item, week, category all stay at the same offsets.
     let sy = batch
         .column(2)
         .as_any()
@@ -146,7 +148,7 @@ fn parquet_round_trips_basic_schema() {
         assert_eq!(week.value(i), expected);
     }
     let cat = batch
-        .column(12)
+        .column(11)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
@@ -170,7 +172,6 @@ fn parquet_writer_atomic_swap_leaves_no_tmp() {
     b.feature_code.append_value(0);
     b.display.append_value(0);
     b.price_reduction.append_value(true);
-    b.source_year.append_value(1);
     b.category.append_value("c");
     b.channel.append_value("drug");
     b.iri_key.append_value(10);
@@ -184,7 +185,6 @@ fn parquet_writer_atomic_swap_leaves_no_tmp() {
     b.feature_code.append_value(1);
     b.display.append_value(1);
     b.price_reduction.append_value(false);
-    b.source_year.append_value(2);
     b.category.append_value("d");
     b.channel.append_value("groc");
     let batch = b.finish(schema()).unwrap();
@@ -266,5 +266,5 @@ fn parquet_file_has_expected_column_metadata() {
     assert_eq!(n_rows, rows as i64);
     let schema = meta.schema_descr();
     let n_cols = schema.num_columns();
-    assert_eq!(n_cols, 14);
+    assert_eq!(n_cols, 13);
 }

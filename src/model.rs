@@ -195,7 +195,12 @@ impl IngestStats {
 /// Compatibility marker for the current output schema.
 /// Bump whenever a field name or Arrow type changes; the manifest stores
 /// this and `ingest-all --resume` will treat older versions as invalid.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+///
+/// Version history:
+/// - v1: 14 columns including `source_year` (redundant with `week`)
+/// - v2: 13 columns; `source_year` removed because it is derivable from
+///   `week` via `fixed_width::week_to_year`.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Marker for the parser code; bump when fixed-width offsets change.
 pub const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");

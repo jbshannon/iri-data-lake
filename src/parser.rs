@@ -210,7 +210,9 @@ fn parse_one(
 
     // Low-cardinality source attributes — appended once per row so that the
     // resulting Parquet file is self-describing even when read in isolation.
-    b.source_year.append_value(identity.year);
+    // `source_year` is intentionally NOT a column: it is redundant with
+    // `week` (see fixed_width::week_to_year) and the partition directory
+    // already encodes year.
     b.category.append_value(&identity.category);
     b.channel.append_value(identity.channel.as_str());
 
@@ -388,7 +390,7 @@ mod tests {
             .unwrap()
             .value(0);
         let ch = batch
-            .column(13)
+            .column(12)
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .unwrap()
