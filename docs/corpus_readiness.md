@@ -22,7 +22,7 @@ another worktree or a decision that has not been made yet.
 | # | gap | impact on a full run | owner |
 |---|---|---|---|
 | G1 | `ingest-all` processes files **sequentially** in a `for` loop (`src/main.rs:172`); `rayon` is a declared dependency but unused. The `--workers` flag is destructured as `workers: _` and discarded. | The full corpus runs at single-file speed. Wall time = sum of per-file times, so no overlap of I/O with compression. | benchmarking / follow-up |
-| G2 | `--resume` on `ingest-all` is destructured as `resume: _`. Resume behaviour actually comes from `config.overwrite`, which `Cli::overwrite_mode` sets to `SkipIfPresent` unless `--overwrite` is passed. | The flag is a no-op. An operator reading `--resume` in the README is reading a promise the binary does not keep. Resume *works* by default, which is the safe direction — but the docs must say so. | docs (here) |
+| G2 | **Fixed on `planning`.** `--resume`/`--overwrite` were parsed but never reached the ingest path: `Cli::overwrite_mode` was never called and `config.overwrite` was never read, so `OverwriteMode` was dead code and `skip_decision` alone drove the skip. `--overwrite` silently skipped; `--resume --overwrite` resolved silently. Now wired through and covered by tests. | — | closed |
 | G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. On 744 files this is the single most likely cause of a partial run. | needs decision |
 | G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | A file whose rows disagree with its filename week range will ingest silently as wrong data. The reconciliation queries in §5 are the only backstop. | needs decision |
 | G5 | `ManifestStatus::InProgress` exists but is never written. | No crash-safe "this file was being written" record. An interrupted run leaves a `.tmp` sibling and no manifest line, so the file is simply re-ingested next pass. Correct, but it means **`*.tmp` files under `data/lake` are the marker of an interrupted run**, and nothing cleans them automatically. | operator step (§4) |
@@ -126,9 +126,10 @@ cargo run --release -- ingest-all --input data/raw --output-root $OUT --dry-run
 ```
 
 Note that 3b and 3c pass **no `--resume`**, and none is needed: skip-if-present
-is the default (§0/G2). Do not pass `--overwrite` at any point in the ramp
-unless we intend to discard and rewrite completed output — it bypasses the
-skip check entirely.
+is the resolved default when neither `--resume` nor `--overwrite` is given.
+Pass `--overwrite` only when you intend to discard and rewrite completed
+output — it now genuinely re-ingests rather than silently skipping. Passing
+both is a hard error.
 
 ### Interruption and restart
 

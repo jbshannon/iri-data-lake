@@ -181,8 +181,13 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 # largest-first, skipping sources already covered by a successful
 # manifest record.
 #
-# Skipping is the DEFAULT (no flag needed). Pass --overwrite to discard
-# existing outputs and rewrite them.
+# Skipping is the DEFAULT (no flag needed) — this is what lets an
+# interrupted full-corpus run simply be re-issued.
+#
+#   --resume      explicit affirmation of that default
+#   --overwrite   discard existing outputs and rewrite them
+#
+# Passing both is an error: they are opposite intents.
 iri-lake ingest-all --input data/raw --output-root data/lake
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
@@ -212,7 +217,20 @@ A source is skippable only if a prior `manifest.jsonl` entry satisfies
 - the recorded `output_paths` still exist on disk.
 
 A failed prior run remains visible and is retried on the next
-`ingest --resume` / `ingest-all --resume`.
+`ingest` / `ingest-all` (a failed record never matches the skip check).
+
+When a prior success *does* match, the flag decides what happens:
+
+| flags | behaviour |
+|---|---|
+| *(neither)* | skip the source (default) |
+| `--resume` | skip the source — explicit affirmation of the default |
+| `--overwrite` | re-ingest, replacing the existing Parquet output |
+| both | error: mutually exclusive |
+
+Library callers choose explicitly via `IngestConfig::overwrite`
+(`SkipIfPresent` / `Overwrite` / `Refuse`; `Refuse` returns an
+`IngestError::OutputsExist` rather than silently skipping).
 
 ## Build & test
 
