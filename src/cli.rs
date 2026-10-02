@@ -22,7 +22,8 @@ pub struct Cli {
     #[arg(long, global = true, env = "IRI_LAKE_ROW_GROUP_ROWS")]
     pub row_group_rows: Option<usize>,
 
-    /// Override compression codec (zstd, snappy, lz4, gzip, uncompressed).
+    /// Override compression codec (zstd, zstd-1, zstd-3, zstd-9,
+    /// snappy, lz4, uncompressed). Anything else warns and uses zstd.
     #[arg(long, global = true, env = "IRI_LAKE_COMPRESSION")]
     pub compression: Option<String>,
 
