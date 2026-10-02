@@ -109,6 +109,12 @@ pub enum IngestError {
     #[error("discovery failed: {0}")]
     Discovery(String),
 
+    #[error(
+        "refusing to overwrite existing output for {path}: prior run {run_id} still \
+         matches. Pass --resume to skip it, or --overwrite to rewrite it."
+    )]
+    OutputsExist { path: PathBuf, run_id: String },
+
     #[error("config error: {0}")]
     Config(String),
 }

@@ -73,11 +73,17 @@ impl IngestConfig {
 
     /// Used by unit tests — gives a deterministic config that doesn't
     /// depend on the host machine's CPU count.
+    ///
+    /// `overwrite` mirrors the effective CLI default (`SkipIfPresent`),
+    /// which is what `ingest` / `ingest-all` resolve to when neither
+    /// `--resume` nor `--overwrite` is passed. `defaults()` declares
+    /// `Refuse` for library callers that have not chosen a policy.
     pub fn for_test() -> Self {
         let mut c = Self::defaults();
         c.worker_threads = Some(2);
         c.batch_rows = 1024;
         c.parquet_row_group_rows = 1024;
+        c.overwrite = OverwriteMode::SkipIfPresent;
         c
     }
 
