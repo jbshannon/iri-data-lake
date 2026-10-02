@@ -14,8 +14,10 @@
 //! 2. `parse_and_arrow` — full parse, finish `RecordBatch`
 //! 3. `parse_and_parquet` — full parse, finish `RecordBatch`, write Parquet
 //!
-//! Use `BENCH_BATCH=<rows>` and `BENCH_COMPRESSION=<codec>` to vary
-//! parameters. See `BENCHMARKING.md` for the full protocol.
+//! Use `BENCH_BATCH=<rows>`, `BENCH_ROW_GROUP=<rows>` and
+//! `BENCH_COMPRESSION=<codec>` to vary parameters. Everything else stays
+//! at `IngestConfig::defaults()`. See `BENCHMARKING.md` for the full
+//! protocol and for measured results.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -151,11 +153,20 @@ fn bench_parse_and_parquet(c: &mut Criterion) {
         .and_then(|s| s.parse().ok())
         .unwrap_or(1_000_000);
 
-    let mut cfg = IngestConfig::for_test();
+    // Benchmark at *production* settings. `IngestConfig::for_test()` sets
+    // `parquet_row_group_rows = 1024`, which would write one row group per
+    // 1024 rows — hundreds of tiny row groups for a real file, and a badly
+    // inflated `parse_and_parquet` number. Only `batch_rows` and the codec
+    // are meant to be swept here.
+    let mut cfg = IngestConfig::defaults();
+    cfg.worker_threads = Some(1);
     if let Ok(codec) = std::env::var("BENCH_COMPRESSION") {
         cfg.compression = codec;
     }
     cfg.batch_rows = batch_size;
+    if let Ok(rg) = std::env::var("BENCH_ROW_GROUP") {
+        cfg.parquet_row_group_rows = rg.parse().unwrap();
+    }
 
     let dir = tempfile::tempdir().unwrap();
 
