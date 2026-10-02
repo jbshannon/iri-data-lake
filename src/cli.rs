@@ -1,0 +1,159 @@
+//! Clap definitions for `iri-lake`.
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::config::{IngestConfig, OverwriteMode, UnknownFeaturePolicy};
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "iri-lake",
+    about = "High-throughput IRI weekly store-sales fixed-width → Parquet ingest",
+    version,
+    propagate_version = true
+)]
+pub struct Cli {
+    /// Override batch size in rows.
+    #[arg(long, global = true, env = "IRI_LAKE_BATCH_ROWS")]
+    pub batch_rows: Option<usize>,
+
+    /// Override Parquet row-group size in rows.
+    #[arg(long, global = true, env = "IRI_LAKE_ROW_GROUP_ROWS")]
+    pub row_group_rows: Option<usize>,
+
+    /// Override compression codec (zstd, snappy, lz4, gzip, uncompressed).
+    #[arg(long, global = true, env = "IRI_LAKE_COMPRESSION")]
+    pub compression: Option<String>,
+
+    /// Override worker thread count.
+    #[arg(long, global = true, env = "IRI_LAKE_WORKER_THREADS")]
+    pub worker_threads: Option<usize>,
+
+    /// Output root for Parquet files. Defaults to `data/lake`.
+    #[arg(long, global = true, env = "IRI_LAKE_OUTPUT_ROOT")]
+    pub output_root: Option<PathBuf>,
+
+    /// Input root for source files. Defaults to `data/raw`.
+    #[arg(long, global = true, env = "IRI_LAKE_INPUT_ROOT")]
+    pub input_root: Option<PathBuf>,
+
+    #[command(subcommand)]
+    pub cmd: Cmd,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Cmd {
+    /// Walk the input tree and report eligible sales files.
+    Inventory {
+        /// Override the input root for this command.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+        format: OutputFormat,
+    },
+    /// Validate the header and record alignment of one sales file.
+    Validate {
+        /// Path to the sales file.
+        path: PathBuf,
+        /// Validate every record (slow).
+        #[arg(long)]
+        full: bool,
+        /// Sample size when not `--full`.
+        #[arg(long, default_value_t = 100)]
+        sample: usize,
+    },
+    /// Convert exactly one sales file into Parquet.
+    Ingest {
+        /// Path to the sales file.
+        path: PathBuf,
+        /// Output root override.
+        #[arg(long)]
+        output_root: Option<PathBuf>,
+        /// Skip if a prior successful record exists.
+        #[arg(long)]
+        resume: bool,
+    },
+    /// Discover and ingest every eligible sales file.
+    IngestAll {
+        /// Input root override.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Output root override.
+        #[arg(long)]
+        output_root: Option<PathBuf>,
+        /// Skip files whose manifest already shows a successful run.
+        #[arg(long)]
+        resume: bool,
+        /// Overwrite any existing Parquet outputs.
+        #[arg(long)]
+        overwrite: bool,
+        /// Discover but don't write any output.
+        #[arg(long)]
+        dry_run: bool,
+        /// Stop after processing N files.
+        #[arg(long)]
+        max_files: Option<usize>,
+        /// Only process this year.
+        #[arg(long)]
+        year: Option<u8>,
+        /// Only process this category.
+        #[arg(long)]
+        category: Option<String>,
+        /// Only process this channel.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Worker threads (defaults to config).
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+    /// Run parser / Arrow / Parquet micro-benchmarks on one file.
+    Benchmark {
+        /// Path to the sales file.
+        path: PathBuf,
+        /// Number of rows per batch.
+        #[arg(long)]
+        batch_rows: Option<usize>,
+        /// Compression codec.
+        #[arg(long)]
+        compression: Option<String>,
+        /// Worker threads.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Repeat each measurement this many times.
+        #[arg(long, default_value_t = 3)]
+        repeats: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutputFormat {
+    Table,
+    Json,
+}
+
+impl Cli {
+    pub fn build_config(&self) -> IngestConfig {
+        let mut cfg = IngestConfig::defaults();
+        cfg.batch_rows = self.batch_rows.unwrap_or(cfg.batch_rows);
+        cfg.parquet_row_group_rows = self.row_group_rows.unwrap_or(cfg.parquet_row_group_rows);
+        cfg.compression = self.compression.clone().unwrap_or(cfg.compression);
+        cfg.worker_threads = self.worker_threads.or(cfg.worker_threads);
+        cfg.input_root = self.input_root.clone().unwrap_or(cfg.input_root);
+        cfg.output_root = self.output_root.clone().unwrap_or(cfg.output_root);
+        cfg
+    }
+
+    pub fn overwrite_mode(&self, cli_overwrite: bool) -> OverwriteMode {
+        if cli_overwrite {
+            OverwriteMode::Overwrite
+        } else {
+            OverwriteMode::SkipIfPresent
+        }
+    }
+
+    pub fn unknown_feature_policy(&self) -> UnknownFeaturePolicy {
+        UnknownFeaturePolicy::Fail
+    }
+}
