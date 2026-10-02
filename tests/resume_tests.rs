@@ -5,7 +5,10 @@ mod common;
 use std::path::Path;
 
 use chrono::Utc;
-use iri_lake::config::IngestConfig;
+use clap::Parser;
+use iri_lake::cli::Cli;
+use iri_lake::config::{IngestConfig, OverwriteMode};
+use iri_lake::errors::IngestError;
 use iri_lake::ingest::{ingest_file, IngestFilter, IngestOutcome};
 use iri_lake::manifest::{skip_decision, JsonlManifest, ManifestStore};
 use iri_lake::model::{
@@ -141,4 +144,98 @@ fn changed_config_forces_re_ingest() {
 
     let second = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
     assert!(matches!(second, IngestOutcome::Completed(_, _)));
+}
+
+// ---------------------------------------------------------------------------
+// Overwrite-policy tests.
+//
+// Regression cover for the case where `OverwriteMode` was declared on
+// `IngestConfig` and set by `Cli::overwrite_mode`, but never read anywhere:
+// `--overwrite` silently skipped, and `--resume` was parsed and discarded.
+// `skip_decision` alone drove the skip, so the policy was unreachable.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn overwrite_mode_re_ingests_even_when_manifest_matches() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = common::fixture_path(tmp.path());
+    let lake = tmp.path().join("lake");
+
+    let mut cfg = IngestConfig::for_test();
+    cfg.overwrite = OverwriteMode::Overwrite;
+    let first = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
+    assert!(matches!(first, IngestOutcome::Completed(_, _)));
+
+    // Nothing about the source or config changed, so `skip_decision` still
+    // reports a match. The Overwrite policy must win over that match.
+    let second = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
+    match second {
+        IngestOutcome::Completed(_, s) => assert_eq!(s.written_rows, 64),
+        other => panic!("expected Completed under Overwrite, got {:?}", other),
+    }
+}
+
+#[test]
+fn refuse_mode_errors_instead_of_skipping_or_overwriting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = common::fixture_path(tmp.path());
+    let lake = tmp.path().join("lake");
+
+    let mut cfg = IngestConfig::for_test();
+    cfg.overwrite = OverwriteMode::Refuse;
+    let first = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
+    assert!(matches!(first, IngestOutcome::Completed(_, _)));
+
+    let err = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default())
+        .expect_err("Refuse must error on a matching prior success");
+    assert!(
+        matches!(err, IngestError::OutputsExist { .. }),
+        "expected OutputsExist, got {:?}",
+        err
+    );
+}
+
+#[test]
+fn skip_if_present_still_skips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = common::fixture_path(tmp.path());
+    let lake = tmp.path().join("lake");
+
+    let mut cfg = IngestConfig::for_test();
+    cfg.overwrite = OverwriteMode::SkipIfPresent;
+    let first = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
+    assert!(matches!(first, IngestOutcome::Completed(_, _)));
+    let second = ingest_file(&p, tmp.path(), &lake, &cfg, &IngestFilter::default()).unwrap();
+    assert!(matches!(second, IngestOutcome::Skipped(_)));
+}
+
+#[test]
+fn resume_and_overwrite_together_are_rejected() {
+    let cli = Cli::parse_from(["iri-lake", "ingest-all", "--resume", "--overwrite"]);
+    let err = cli
+        .overwrite_mode(true, true)
+        .expect_err("opposite intents must not resolve silently");
+    assert!(err.contains("mutually exclusive"), "got: {}", err);
+}
+
+#[test]
+fn flag_pairs_map_to_expected_policies() {
+    // Neither flag: skipping stays the default so an interrupted
+    // 744-file run can simply be re-issued.
+    let cli = Cli::parse_from(["iri-lake", "ingest-all"]);
+    assert_eq!(
+        cli.overwrite_mode(false, false).unwrap(),
+        OverwriteMode::SkipIfPresent
+    );
+    // --resume is an explicit affirmation of the same default.
+    let cli = Cli::parse_from(["iri-lake", "ingest-all", "--resume"]);
+    assert_eq!(
+        cli.overwrite_mode(true, false).unwrap(),
+        OverwriteMode::SkipIfPresent
+    );
+    let cli = Cli::parse_from(["iri-lake", "ingest-all", "--overwrite"]);
+    assert_eq!(
+        cli.overwrite_mode(false, true).unwrap(),
+        OverwriteMode::Overwrite
+    );
 }

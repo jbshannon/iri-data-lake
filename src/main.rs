@@ -12,6 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use iri_lake::cli::{Cli, Cmd, OutputFormat};
 use iri_lake::discovery;
+use iri_lake::errors::IngestError;
 use iri_lake::ingest::{ingest_file, IngestFilter, IngestOutcome};
 use iri_lake::model::Channel;
 use iri_lake::validation::validate_file;
@@ -40,7 +41,16 @@ fn init_tracing() {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let config = cli.build_config();
+    let mut config = cli.build_config();
+    // Resolve the skip/overwrite policy once, up front, so that a
+    // contradictory pair of flags fails before any work starts.
+    let resume = matches!(&cli.cmd, Cmd::Ingest { resume, .. } if *resume)
+        || matches!(&cli.cmd, Cmd::IngestAll { resume, .. } if *resume);
+    let overwrite = matches!(&cli.cmd, Cmd::IngestAll { overwrite, .. } if *overwrite);
+    config.overwrite = cli
+        .overwrite_mode(resume, overwrite)
+        .map_err(IngestError::Config)
+        .map_err(anyhow::Error::from)?;
     match cli.cmd {
         Cmd::Inventory { input, format } => {
             let root = input.unwrap_or_else(|| config.input_root.clone());
@@ -332,8 +342,7 @@ fn print_validation(r: &iri_lake::validation::ValidationReport) {
 fn run_benchmark(path: &Path, cfg: &iri_lake::config::IngestConfig, repeats: usize) -> Result<()> {
     anyhow::ensure!(repeats >= 1, "--repeats must be at least 1");
 
-    let scratch = tempfile::tempdir()
-        .context("create scratch output root for benchmark")?;
+    let scratch = tempfile::tempdir().context("create scratch output root for benchmark")?;
 
     let mut measurements: Vec<serde_json::Value> = Vec::new();
     for i in 0..repeats {

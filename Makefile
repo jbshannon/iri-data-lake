@@ -33,6 +33,7 @@ help:
 	@echo "  make ingest-all     Walk $(IN) and ingest every eligible sales file"
 	@echo "  make clean          cargo clean + remove criterion/ and target/"
 	@echo "  make fixtures       Re-emit test fixtures into tests/fixtures/"
+	@echo "  make readiness      Gated plan for the full 143 GB corpus run"
 
 .PHONY: fmt
 fmt:
@@ -72,7 +73,7 @@ ingest:
 
 .PHONY: ingest-all
 ingest-all:
-	$(BIN) run -- ingest-all --input $(IN) --output-root $(OUT) --resume
+	$(BIN) run -- ingest-all --input $(IN) --output-root $(OUT)
 
 .PHONY: clean
 clean:
@@ -82,6 +83,12 @@ clean:
 .PHONY: fixtures
 fixtures:
 	$(BIN) test --test fixtures_emit -- --nocapture
+
+# ---- Full-corpus run -------------------------------------------------------
+
+.PHONY: readiness
+readiness:
+	@echo "See docs/corpus_readiness.md for the gated full-corpus plan."
 
 # ---- Convenience for tracing ----------------------------------------------
 

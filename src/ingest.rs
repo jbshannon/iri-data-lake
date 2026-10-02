@@ -26,7 +26,7 @@ use memmap2::Mmap;
 use uuid::Uuid;
 
 use crate::arrow_output::{schema, SalesBuilders};
-use crate::config::IngestConfig;
+use crate::config::{IngestConfig, OverwriteMode};
 use crate::discovery::parse_identity;
 use crate::errors::{IngestError, Result};
 use crate::fixed_width::{self, HEADER_LEN, RECORD_LEN};
@@ -217,7 +217,28 @@ pub fn ingest_file(
     };
 
     if let Some(prior_ok) = skip_decision(&prospective, prior.as_ref())? {
-        return Ok(IngestOutcome::Skipped(prior_ok));
+        // `skip_decision` decides only *whether* a prior successful run
+        // still matches this source and config. Whether that match is
+        // allowed to short-circuit the ingest is the caller's policy.
+        match config.overwrite {
+            OverwriteMode::SkipIfPresent => return Ok(IngestOutcome::Skipped(prior_ok)),
+            OverwriteMode::Overwrite => {
+                // Explicitly asked to rewrite: fall through and re-ingest.
+                // The Parquet writer renames over the existing file, so
+                // the output is replaced in place.
+                tracing::info!(
+                    source = %path.display(),
+                    prior_run = %prior_ok.run_id,
+                    "overwriting prior output (--overwrite)"
+                );
+            }
+            OverwriteMode::Refuse => {
+                return Err(IngestError::OutputsExist {
+                    path: path.to_path_buf(),
+                    run_id: prior_ok.run_id,
+                });
+            }
+        }
     }
 
     // ---- 4. mmap + validate header + parse in batches ------------------

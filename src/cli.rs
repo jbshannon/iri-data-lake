@@ -146,12 +146,31 @@ impl Cli {
         cfg
     }
 
-    pub fn overwrite_mode(&self, cli_overwrite: bool) -> OverwriteMode {
-        if cli_overwrite {
+    pub fn overwrite_mode(
+        &self,
+        cli_resume: bool,
+        cli_overwrite: bool,
+    ) -> Result<OverwriteMode, String> {
+        // `--resume` and `--overwrite` are opposite intents. Clap cannot
+        // express this as a conflict (both are meaningful on their own),
+        // so reject the combination rather than letting `--overwrite` win
+        // silently -- a caller asking to resume is not asking to destroy
+        // completed output.
+        if cli_resume && cli_overwrite {
+            return Err(
+                "--resume and --overwrite are mutually exclusive: --resume keeps \
+                 existing outputs, --overwrite deletes and rewrites them"
+                    .to_string(),
+            );
+        }
+        // Skipping completed sources is the default, so an interrupted
+        // 744-file run can simply be re-issued. `--resume` states that
+        // intent explicitly; it is an affirmation, not an opt-in.
+        Ok(if cli_overwrite {
             OverwriteMode::Overwrite
         } else {
             OverwriteMode::SkipIfPresent
-        }
+        })
     }
 
     pub fn unknown_feature_policy(&self) -> UnknownFeaturePolicy {
