@@ -1,0 +1,78 @@
+[package]
+name = "iri-lake"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "High-throughput fixed-width IRI weekly store-sales to Parquet lakehouse ingest tool"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+
+[[bin]]
+name = "iri-lake"
+path = "src/main.rs"
+
+[lib]
+name = "iri_lake"
+path = "src/lib.rs"
+
+[dependencies]
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# CLI
+clap = { version = "4.5", features = ["derive", "env", "string"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Time / IDs
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+
+# Filesystem traversal
+walkdir = "2.5"
+
+# Hashing
+sha2 = "0.10"
+hex = "0.4"
+
+# Temp dirs in tests/examples
+tempfile = "3.13"
+
+# Memory-mapped reads
+memmap2 = "0.9"
+
+# Parallelism (bounded worker pool)
+rayon = "1.10"
+
+# Arrow + Parquet
+arrow = { version = "53", default-features = false, features = ["prettyprint"] }
+arrow-array = "53"
+arrow-schema = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+
+[dev-dependencies]
+approx = "0.5"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.13"
+
+[[bench]]
+name = "parse_sales"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

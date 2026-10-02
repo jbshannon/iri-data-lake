@@ -1,2 +1,29 @@
-**/*.DS_Store
-data
+# Build artifacts
+/target/
+**/*.rs.bk
+**/*.pdb
+
+# Local development
+*.swp
+*.swo
+.DS_Store
+.pi/
+
+# Generated lakehouse output (large)
+/data/lake/
+!data/lake/.gitkeep
+/data/raw/
+!data/raw/.gitkeep
+
+# Manifest outputs that may appear outside of /data/lake during local dev
+/manifest.jsonl
+*.tmp
+*.part
+
+# Criterion benchmark output
+/criterion/
+/benches/target/
+
+# Editor
+.vscode/
+.idea/
