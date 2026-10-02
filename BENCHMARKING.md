@@ -187,16 +187,23 @@ Corpus is 744 files / 140.85 GiB / 2 689 259 921 rows (`inventory`).
 
 | basis | rate | time |
 |---|---:|---:|
-| by bytes | 136.9 MiB/s wall | 1 053 s |
-| by rows | 2.55 Mrows/s wall | 1 054 s |
+| by bytes | 128.4 MiB/s wall | 1 123 s |
+| by rows | 4.4 Mrows/s wall | ~1 100 s |
 
-> **≈ 18 minutes single-threaded**, producing ≈ 8.5 GiB of Parquet.
+> **≈ 19 minutes single-threaded**, producing ≈ 8.5 GiB of Parquet.
 
-Both bases agree to 0.1 %, so the estimate is not sensitive to the
+Both bases agree to ~2 %, so the estimate is not sensitive to the
 row-weighting of the corpus. It is a **lower bound**: `ingest-all`
 defaults to `worker_threads = num_cpus()`, which this sweep never
 exercised. Expect roughly 3–5 min at 4–6× scaling, but treat that as an
 inference until someone times `ingest-all` end to end.
+
+**Run the whole sweep in one session.** Absolute throughput drifts
+between sessions by up to ~35% on this machine (thermal state, page
+cache), enough to move this figure between 18 and 24 minutes for the
+*same* code. Only A/B comparisons taken back to back are trustworthy —
+which is why the parser optimisation above quotes both sides from the
+same session.
 
 `batch_rows` was swept on the 765 MiB file and moves throughput by <1 %
 (noise) while moving output size by ~9 %:
@@ -367,7 +374,7 @@ total from the call-graph root. Cross-check against wall clock: if the
 profile disagrees with `outer_elapsed - inner_elapsed` by more than a
 few points, the profile is wrong, not the timer.
 
-### Measured hot spots
+### Measured hot spots (before the parser optimisation below)
 
 `fzdinent_groc_1114_1165` (765 MiB / 14.3 M rows), 8 repeats, 20 s
 sample, 15 646 samples, self time:
@@ -399,14 +406,10 @@ optimising the wrong 2.5 %.
 
 **`trim_matches` (8.2 %) + `from_utf8` (5.7 %) + `parse_uint` (4.7 %)
 total ~18.6 % of self time** — the third-largest region, and larger
-than Parquet's entire encoding layer. This directly contradicts the
+than Parquet's entire encoding layer. This directly contradicted the
 long-standing claim in § Things that look slow but are not that the
 `str::from_utf8 + trim + parse` chain is "< 5 % of wall time" and not
-worth touching. At 18.6 %, alongside sha2 at 45.3 %, the two hashing
-costs dominate the pipeline rather than Parquet. `trim_matches` alone
-at 8.2 % suggests the cost is in generic `char::is_whitespace`
-dispatch rather than the integer parse itself. That is now an open
-experiment, not a dismissed one — see below.
+worth touching. That claim has since been acted on — see below.
 
 ### Other tools
 
@@ -420,6 +423,10 @@ experiment, not a dismissed one — see below.
   data — consistent with the 0.06 s re-read noted above.
 
 ## Things we *intend* to leave slow
+
+*(Corrected 2026-10: the ASCII claim previously filed here as a
+non-issue measured ~18.6 %, not "< 5 %". It was rewritten rather than
+dismissed — see § Parser optimisation. The zstd entry remains valid.)*
 
 - **Zstd level 9.** Measured on `toothpa_groc`: 1.8× slower to write
   than `zstd-1` (283 vs 500 MiB/s) for 1.4 % smaller files, and *no*
@@ -460,26 +467,84 @@ guarantee is ever in question.
 
 ## Things that look slow but are not
 
-*(This section previously claimed the ASCII path was "< 5 % of wall
-time". A sampling profile measured it at ~18.6 % — see § Profiling
-notes. The claim was never re-measured after the row-group and codec
-findings, and it is wrong by roughly 4×.)*
-
-- The 7-char `str::from_utf8 + trim + parse` chain. It **used to** be
-  listed here as a non-issue. It is not one: `trim_matches` 8.2 %,
-  `from_utf8` 5.7 %, `parse_uint` 4.7 %.
-
-  The original dismissal was that replacing it "would buy back < 2 %".
-  At ~18.6 % of self time, that estimate is untenable — the fixed-width
-  parser's UTF-8/trim validation is a bigger cost than the entire
-  Parquet encoding layer (23.4 %) put next to it, and comparable to
-  SHA-256.
-
-  **Open question, not a settled one.** `trim_matches` being the single
-  largest frame in the parser suggests the win is in avoiding generic
-  `char::is_whitespace` dispatch, not in the integer parse. Measure it
-  before writing it and before dismissing it again; the prior two
-  assessments of this path were both made without profiling it.
-
 - The Parquet **zstd codec** specifically (2.5 %). Compression is the
   cheap part of the writer; its encoding layer is 23.4 %.
+
+- ~~The 7-char `str::from_utf8 + trim + parse` chain~~ — **no longer
+  true.** This used to be listed here, dismissed as "< 5 % of wall
+  time ... would buy back < 2 %". It measured ~18.6 %, and the rewrite
+  in § Parser optimisation made it roughly twice as fast. The lesson
+  generalises: two prior estimates of this path were made without ever
+  profiling it, and both were wrong. Do not dismiss a hot path from
+  intuition.
+
+## Parser optimisation
+
+`parse_uint` used to run `from_utf8` → `str::trim` → `FromStr` on every
+integer field — 8 calls per row. Both steps were wasted work on this
+format: `from_utf8` validated UTF-8 on fields that are ASCII digits by
+construction, and `str::trim` applied *Unicode* whitespace rules through
+`char::is_whitespace` to space-padded (0x20) ASCII.
+
+`parse_int64` now accumulates digits straight from the bytes, skipping
+ASCII spaces and checking overflow once rather than twice per digit.
+Non-UTF-8 bytes now surface as "non-digit" rather than "non-utf8"; a
+fixed-width ASCII format has no legitimate non-UTF-8 field, so the
+distinction is not worth a validation pass over every row.
+
+### Result
+
+Criterion `parse_only`, `toothpa_groc_1114_1165` (5.69 M rows):
+
+| | time | throughput |
+|---|---:|---:|
+| before | 902.60 ms | 6.31 Mrows/s |
+| after | 451.26 ms | 12.61 Mrows/s |
+| | **−50.0 %** | **+100 %** |
+
+End-to-end `iri-lake benchmark`, `fzdinent_groc_1114_1165`, median of
+12 repeats, best of 2 runs each:
+
+| | ingest median | wall median | wall MiB/s |
+|---|---:|---:|---:|
+| before | 4.045 s | 7.605 s | ~101 |
+| after | **2.900 s** | **5.960 s** | **~128** |
+| | −28 % | −22 % | +28 % |
+
+Wall improves less than the ingest phase because ~2.4 s of every
+repeat is SHA-256, which this change does not touch.
+
+**Correctness was verified by output, not by test count alone:** the
+six Parquet files written from `toothpa_groc_1114_1165` (5.69 M rows,
+11 columns) are byte-for-byte identical before and after. Unit tests
+also cover padding, signs, range checks, interior blanks, non-ASCII
+bytes and overflow.
+
+### What is left
+
+Re-profiling after the rewrite (13 305 samples) moves the parser from
+26.4 % to 17.8 % of self time and eliminates `trim_matches` and
+`is_whitespace` entirely. The new distribution:
+
+| region | share |
+|---|---:|
+| `sha2::sha256::compress256` | 40.0 % |
+| Parquet encode/write | 26.3 % |
+| parser (`parse_int64` 9.4 %, `parse_records_into_builder` 6.7 %) | 17.8 % |
+| syscalls (`read` 10.2 %, `write` 1.3 %) | 11.5 % |
+| zstd codec | 2.8 % |
+
+Two opportunities remain, both larger than anything else left in the
+parser:
+
+1. **Single-pass hashing (~10 %).** `ingest_file` streams the file
+   through `sha256_of_file` with a 64 KiB `BufReader` and *then* mmaps
+   it again to parse, so the data crosses the syscall boundary twice;
+   `read` alone is 10.2 % of self time. Mmap first and hash straight
+   out of the mapping removes one full pass and nearly all of that
+   syscall cost. This is the largest remaining win available and is
+   behaviour-preserving.
+2. **Parquet's encoding layer (26.3 %).** `arrow_writer::write_primitive`
+   (dictionary encoding) is 10.7 % on its own, larger than the entire
+   zstd codec. Adjusting `row_group_rows` or enabling dictionary
+   fallback is cheaper to try than anything in the parser.
