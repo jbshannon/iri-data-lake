@@ -126,7 +126,7 @@ fn parses_default_fixture_into_arrow() {
     parse_records_into_builder(&id, body, 0, rows, &mut builders).unwrap();
     let batch = builders.finish(schema()).unwrap();
     assert_eq!(batch.num_rows(), 64);
-    assert_eq!(batch.num_columns(), 13);
+    assert_eq!(batch.num_columns(), 11);
 
     // Spot-check a few columns.
     let iri = batch
@@ -144,11 +144,6 @@ fn parses_default_fixture_into_arrow() {
         .as_any()
         .downcast_ref::<arrow_array::BooleanArray>()
         .unwrap();
-    let ch = batch
-        .column(12)
-        .as_any()
-        .downcast_ref::<arrow_array::StringArray>()
-        .unwrap();
 
     assert_eq!(iri.value(0), 1_000_000);
     assert_eq!(cents.value(0), 0); // 0.00
@@ -156,7 +151,8 @@ fn parses_default_fixture_into_arrow() {
     assert_eq!(cents.value(2), 198); // 1.98
     assert!(!pr.value(0)); // price_reduction was '0' on even rows
     assert!(pr.value(1));
-    assert_eq!(ch.value(0), "drug");
+    // `channel` is no longer a physical column; a Hive-aware reader
+    // would expose it as a virtual column from the partition directory.
 }
 
 #[test]

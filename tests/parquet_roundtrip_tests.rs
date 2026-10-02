@@ -12,7 +12,7 @@ use std::fs::File;
 use std::path::Path;
 
 use arrow_array::{
-    Array, BooleanArray, Int64Array, RecordBatch, StringArray, UInt16Array, UInt32Array, UInt8Array,
+    Array, BooleanArray, Int64Array, RecordBatch, UInt16Array, UInt32Array, UInt8Array,
 };
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
@@ -109,15 +109,10 @@ fn parquet_round_trips_basic_schema() {
         );
     }
 
-    // Channel string round-trip
-    let ch = batch
-        .column(12)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    for i in 0..rows {
-        assert_eq!(ch.value(i), "drug");
-    }
+    // Channel and category are no longer round-tripped as columns:
+    // they are read back as virtual Hive partition columns by a
+    // Hive-aware reader. The standalone reader sees only the
+    // raw data columns.
 
     // source_year is no longer a physical column; year is derivable
     // from week (or read from the partition directory). Sy, feature_code,
@@ -147,14 +142,8 @@ fn parquet_round_trips_basic_schema() {
         let expected = 1114u16 + ((i / 100) as u16);
         assert_eq!(week.value(i), expected);
     }
-    let cat = batch
-        .column(11)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    for i in 0..rows {
-        assert_eq!(cat.value(i), "beer");
-    }
+    // `category` is no longer a physical column — a Hive-aware reader
+    // would expose it as a virtual column from the partition directory.
 }
 
 #[test]
@@ -172,8 +161,6 @@ fn parquet_writer_atomic_swap_leaves_no_tmp() {
     b.feature_code.append_value(0);
     b.display.append_value(0);
     b.price_reduction.append_value(true);
-    b.category.append_value("c");
-    b.channel.append_value("drug");
     b.iri_key.append_value(10);
     b.week.append_value(20);
     b.sy.append_value(30);
@@ -185,8 +172,6 @@ fn parquet_writer_atomic_swap_leaves_no_tmp() {
     b.feature_code.append_value(1);
     b.display.append_value(1);
     b.price_reduction.append_value(false);
-    b.category.append_value("d");
-    b.channel.append_value("groc");
     let batch = b.finish(schema()).unwrap();
 
     let final_path = tmp.path().join("nested/dir/out.parquet");
@@ -266,5 +251,5 @@ fn parquet_file_has_expected_column_metadata() {
     assert_eq!(n_rows, rows as i64);
     let schema = meta.schema_descr();
     let n_cols = schema.num_columns();
-    assert_eq!(n_cols, 13);
+    assert_eq!(n_cols, 11);
 }

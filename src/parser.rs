@@ -208,13 +208,11 @@ fn parse_one(
     };
     b.price_reduction.append_value(pr_bool);
 
-    // Low-cardinality source attributes — appended once per row so that the
-    // resulting Parquet file is self-describing even when read in isolation.
-    // `source_year` is intentionally NOT a column: it is redundant with
-    // `week` (see fixed_width::week_to_year) and the partition directory
-    // already encodes year.
-    b.category.append_value(&identity.category);
-    b.channel.append_value(identity.channel.as_str());
+    // Low-cardinality source attributes are NOT appended here:
+    // `source_year`, `category`, and `channel` are partition-only metadata.
+    // They live in the Hive-style directory layout (`year=N/category=…/
+    // channel=…/`) and are read back by Hive-aware engines (DuckDB with
+    // `hive_partitioning=true`, PyArrow, Polars, Spark, Iceberg, Delta).
 
     Ok(())
 }
@@ -389,17 +387,12 @@ mod tests {
             .downcast_ref::<arrow_array::BooleanArray>()
             .unwrap()
             .value(0);
-        let ch = batch
-            .column(12)
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap()
-            .value(0);
 
         assert_eq!(iri, 1_234_567);
         assert_eq!(week, 1114);
         assert_eq!(dollars, 929);
         assert!(!pr);
-        assert_eq!(ch, "drug");
+        // `category` and `channel` are no longer physical columns —
+        // they come back as virtual columns via Hive partitioning.
     }
 }

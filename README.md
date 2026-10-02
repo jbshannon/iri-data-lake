@@ -75,6 +75,13 @@ consulting the directory layout.
 
 ## Canonical schema
 
+The schema contains only the **raw data columns** parsed out of the
+fixed-width record. `source_year`, `category`, and `channel` are
+deliberately omitted from the physical columns; they live exclusively
+in the Hive-style partition directory layout (`year=N/category=…/
+channel=…/`) and are read back as virtual columns by any Hive-aware
+reader.
+
 | column | Arrow type | source field |
 |---|---|---|
 | `iri_key` | `UInt32` | `IRI_KEY` (1–7) |
@@ -88,16 +95,34 @@ consulting the directory layout.
 | `feature_code` | `UInt8` | `F` (47–50), see below |
 | `display` | `UInt8` | `D` (52) |
 | `price_reduction` | `Boolean` | `PR` (54) |
-| `category` | `Utf8` | physical, from filename |
-| `channel` | `Utf8` | physical, from filename |
 
-`source_year` is **deliberately omitted** from the physical columns. The
-IRI `WEEK` field is a single integer counter (range 1114-1739 across the
-12 years, contiguous, non-overlapping) that maps to academic year
-1-12 via a deterministic function — see `fixed_width::week_to_year`.
-Year remains in the partition directory (`year=N/`) but is not duplicated
-inside every row. `category` and `channel` are still physical columns
-because they aren't derivable from the row content.
+`source_year` is derivable from `week` via `fixed_width::week_to_year`
+(week 1114-1165 -> year 1, …, week 1687-1739 -> year 12; contiguous,
+non-overlapping across the 12 years). `category` and `channel` are
+constant per source file and so belong with the file metadata rather
+than the row content.
+
+### Reading with Hive partitioning
+
+The directory layout is the modern lakehouse convention (Iceberg, Delta,
+DuckDB Hive mode, Spark, Trino, Athena). DuckDB example:
+
+```sql
+-- Hive-aware: `year`, `category`, `channel` come back as virtual columns
+SELECT year, category, channel, count(*) AS rows, sum(dollars_cents)/100.0 AS total
+FROM read_parquet(
+    'data/lake/bronze/iri_sales/**/*.parquet',
+    hive_partitioning = true
+)
+GROUP BY year, category, channel
+ORDER BY total DESC
+LIMIT 20;
+```
+
+For a tool that doesn't recognise Hive partitioning, only the eleven
+raw data columns above are visible; partition values are accessed by
+reading the path. PyArrow and Polars have the same `hive_partitioning`
+flag with the same semantics.
 
 ### Type-tightening rules
 

@@ -1,21 +1,36 @@
 //! Arrow schema and column-builder wrapper for sales facts.
 //!
-//! `category` and `channel` are physically included so that standalone
-//! Parquet files are self-describing and trivially readable from DuckDB,
-//! Spark, Polars, etc. without consulting the directory layout.
+//! The schema contains only the **raw data columns** — the eleven fields
+//! parsed out of the fixed-width record:
 //!
-//! `source_year` is **deliberately omitted** from the physical columns.
-//! The IRI WEEK field is a single integer counter (1114..=1739) that
-//! maps to academic year 1..=12 via a deterministic, contiguous
-//! function — see `fixed_width::week_to_year`. The directory layout
-//! still partitions by year (Hive convention), but the year is not
-//! duplicated inside every row.
+//! ```text
+//! iri_key, week, sy, ge, vend, item, units, dollars_cents,
+//! feature_code, display, price_reduction
+//! ```
+//!
+//! `source_year`, `category`, and `channel` are **deliberately omitted**
+//! from the physical columns. They are encoded in the Hive-style
+//! partition directory layout (`year=N/category=…/channel=…/`) and any
+//! Hive-aware engine (DuckDB with `hive_partitioning=true`, PyArrow,
+//! Polars, Spark, Iceberg, Delta Lake) reads them as virtual columns
+//! from the directory names. This is the modern lakehouse convention
+//! (Iceberg/Delta) and avoids:
+//!
+//! - redundancy between file content and directory metadata
+//! - duplicate-column conflicts in readers that auto-detect Hive
+//!   partitioning and merge partition columns into the schema
+//! - wasted bytes on what is essentially a constant per file
+//!
+//! `source_year` is additionally derivable from `week` via
+//! `fixed_width::week_to_year`; `category` and `channel` are not
+//! derivable from row content but are still partition-only because
+//! they are constant per file.
 
 use std::sync::Arc;
 
 use arrow_array::builder::{
-    ArrayBuilder, BooleanBuilder, Int32Builder, Int64Builder, StringBuilder, UInt16Builder,
-    UInt32Builder, UInt8Builder,
+    ArrayBuilder, BooleanBuilder, Int32Builder, Int64Builder, UInt16Builder, UInt32Builder,
+    UInt8Builder,
 };
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
@@ -25,10 +40,12 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 /// the on-disk manifest schema_version matches.
 ///
 /// Version history:
-/// - v1: 14 columns including `source_year` (redundant with `week`)
-/// - v2: 13 columns; `source_year` removed because it is derivable
-///   from `week` via `fixed_width::week_to_year`. Year remains the
-///   partition directory.
+/// - v1: 14 columns including `source_year`, `category`, `channel`.
+/// - v2: 13 columns; `source_year` removed (derivable from `week`).
+/// - v3: 11 columns; `category` and `channel` removed too. All three
+///   are partition-only now, following the modern lakehouse convention
+///   (Iceberg/Delta) where partition columns live in the table
+///   metadata, not in the data files.
 pub fn schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("iri_key", DataType::UInt32, false),
@@ -42,11 +59,6 @@ pub fn schema() -> SchemaRef {
         Field::new("feature_code", DataType::UInt8, false),
         Field::new("display", DataType::UInt8, false),
         Field::new("price_reduction", DataType::Boolean, false),
-        // `source_year` is intentionally NOT a column here. Year is
-        // encoded in the partition directory and is derivable from
-        // `week` via `fixed_width::week_to_year`.
-        Field::new("category", DataType::Utf8, false),
-        Field::new("channel", DataType::Utf8, false),
     ]))
 }
 
@@ -75,8 +87,6 @@ pub struct SalesBuilders {
     pub feature_code: UInt8Builder,
     pub display: UInt8Builder,
     pub price_reduction: BooleanBuilder,
-    pub category: StringBuilder,
-    pub channel: StringBuilder,
 }
 
 impl SalesBuilders {
@@ -93,8 +103,6 @@ impl SalesBuilders {
             feature_code: UInt8Builder::with_capacity(capacity),
             display: UInt8Builder::with_capacity(capacity),
             price_reduction: BooleanBuilder::with_capacity(capacity),
-            category: StringBuilder::with_capacity(capacity, 16),
-            channel: StringBuilder::with_capacity(capacity, 4),
         }
     }
 
@@ -121,8 +129,6 @@ impl SalesBuilders {
                 Arc::new(self.feature_code.finish()),
                 Arc::new(self.display.finish()),
                 Arc::new(self.price_reduction.finish()),
-                Arc::new(self.category.finish()),
-                Arc::new(self.channel.finish()),
             ],
         )
     }
@@ -143,8 +149,6 @@ impl SalesBuilders {
         self.feature_code = UInt8Builder::with_capacity(capacity);
         self.display = UInt8Builder::with_capacity(capacity);
         self.price_reduction = BooleanBuilder::with_capacity(capacity);
-        self.category = StringBuilder::with_capacity(capacity, 16);
-        self.channel = StringBuilder::with_capacity(capacity, 4);
     }
 }
 
@@ -163,8 +167,6 @@ pub fn assert_builders_consistent(b: &SalesBuilders) {
         ("feature_code", b.feature_code.len()),
         ("display", b.display.len()),
         ("price_reduction", b.price_reduction.len()),
-        ("category", b.category.len()),
-        ("channel", b.channel.len()),
     ];
     for (name, len) in all {
         assert_eq!(len, n, "builder {} out of sync: {} vs {}", name, len, n);
@@ -178,17 +180,17 @@ mod tests {
     #[test]
     fn schema_is_stable() {
         let s = schema();
-        assert_eq!(s.fields().len(), 13);
+        assert_eq!(s.fields().len(), 11);
         assert_eq!(s.field(0).name(), "iri_key");
         assert_eq!(s.field(0).data_type(), &DataType::UInt32);
         assert_eq!(s.field(7).name(), "dollars_cents");
         assert_eq!(s.field(7).data_type(), &DataType::Int64);
         assert_eq!(s.field(10).name(), "price_reduction");
         assert_eq!(s.field(10).data_type(), &DataType::Boolean);
-        // After the source_year removal (v2), column 11 is category and
-        // column 12 is channel. There is no physical source_year column.
-        assert_eq!(s.field(11).name(), "category");
-        assert_eq!(s.field(12).name(), "channel");
+        // After v3, only the 11 raw-data columns remain. source_year,
+        // category, channel are partition-only.
+        assert_eq!(s.field(0).name(), "iri_key");
+        assert_eq!(s.field(10).name(), "price_reduction");
     }
 
     #[test]
@@ -205,13 +207,11 @@ mod tests {
         b.feature_code.append_value(0);
         b.display.append_value(0);
         b.price_reduction.append_value(false);
-        b.category.append_value("beer");
-        b.channel.append_value("drug");
         assert_builders_consistent(&b);
         let batch = b.finish(schema()).unwrap();
         assert_eq!(batch.num_rows(), 1);
-        assert_eq!(batch.num_columns(), 13);
-        // Sanity: schema version bumped to 2 when source_year was removed.
-        assert_eq!(crate::model::CURRENT_SCHEMA_VERSION, 2);
+        assert_eq!(batch.num_columns(), 11);
+        // Sanity: schema version 3 once they are partition-only.
+        assert_eq!(crate::model::CURRENT_SCHEMA_VERSION, 3);
     }
 }

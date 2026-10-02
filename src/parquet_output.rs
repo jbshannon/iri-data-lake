@@ -141,8 +141,6 @@ mod tests {
         b.feature_code.append_value(0);
         b.display.append_value(0);
         b.price_reduction.append_value(true);
-        b.category.append_value("c");
-        b.channel.append_value("drug");
         b.iri_key.append_value(10);
         b.week.append_value(20);
         b.sy.append_value(30);
@@ -154,8 +152,6 @@ mod tests {
         b.feature_code.append_value(1);
         b.display.append_value(1);
         b.price_reduction.append_value(false);
-        b.category.append_value("d");
-        b.channel.append_value("groc");
         let batch: RecordBatch = b.finish(schema()).unwrap();
 
         let dir = tempfile::tempdir().unwrap();

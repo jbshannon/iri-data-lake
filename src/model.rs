@@ -197,10 +197,13 @@ impl IngestStats {
 /// this and `ingest-all --resume` will treat older versions as invalid.
 ///
 /// Version history:
-/// - v1: 14 columns including `source_year` (redundant with `week`)
-/// - v2: 13 columns; `source_year` removed because it is derivable from
-///   `week` via `fixed_width::week_to_year`.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// - v1: 14 columns including `source_year`, `category`, `channel`.
+/// - v2: 13 columns; `source_year` removed (derivable from `week`).
+/// - v3: 11 columns; `category` and `channel` removed too. All three
+///   are partition-only now, following the modern lakehouse convention
+///   where partition columns live in the table/directory metadata, not
+///   in the data files.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 /// Marker for the parser code; bump when fixed-width offsets change.
 pub const PARSER_VERSION: &str = env!("CARGO_PKG_VERSION");

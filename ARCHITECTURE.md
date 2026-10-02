@@ -170,10 +170,20 @@ channel)`. We deliberately exclude `week` from the partition columns:
   splitting it across 52 partition directories would defeat the
   point of writing one file per source).
 
-`category` and `channel` are also included as **physical columns**
-inside the Parquet file so that standalone files are self-describing.
+**The Parquet files do NOT contain partition columns.** `source_year`,
+`category`, and `channel` are partition-only metadata; they live in the
+directory layout (`year=N/category=…/channel=…/`) and any Hive-aware
+reader (DuckDB with `hive_partitioning=true`, PyArrow, Polars, Spark,
+Trino, Iceberg, Delta) reads them as virtual columns from the
+directory names. This is the modern lakehouse convention
+(Iceberg/Delta): partition columns are table metadata, not row content.
 
-`source_year` is **not** a physical column. The IRI `WEEK` field is a
+The trade-off is that a reader without Hive-awareness sees only the
+eleven raw data columns and would have to compute year from `week` via
+`fixed_width::week_to_year` (or just know which file it is reading).
+For analytical workloads the Hive-aware path is the standard.
+
+`source_year` in particular is fully derivable: the IRI `WEEK` field is a
 single integer counter (1114-1739 across the 12 years, contiguous,
 non-overlapping), so year is a deterministic function of week:
 
