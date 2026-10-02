@@ -1,11 +1,15 @@
 # Corpus readiness — running the full IRI corpus
 
-Status: **plan only.** No code changes land from this document. It exists so
+Status: **mostly plan.** This document changes no behaviour, but it did
+surface one bug (gap G2), fixed in the same branch: `--resume` and
+`--overwrite` were inert. The rest are records and proposals. The point is
 that the first all-corpus ingest is a *gated* operation rather than an
 exploratory one.
 
-The design point is the full corpus: **≈143 GB raw / 2.7 B rows / 744 sales
-files**, largest file ≈1.3 GB / 220 M rows. `ARCHITECTURE.md` describes the
+The design point is the full corpus: **140.85 GiB raw / 2.69 B rows / 744 sales
+files**, largest file ≈1.3 GB / 220 M rows (measured via `inventory`; see
+§2 — `README.md` rounds this to "≈143 GB / 2.7 B", conflating GB with GiB).
+`ARCHITECTURE.md` describes the
 per-file pipeline; this document describes how to get from "works on one
 fixture" to "the whole corpus is in the lake and reconciled".
 
@@ -21,13 +25,13 @@ another worktree or a decision that has not been made yet.
 
 | # | gap | impact on a full run | owner |
 |---|---|---|---|
-| G1 | `ingest-all` processes files **sequentially** in a `for` loop (`src/main.rs:172`); `rayon` is a declared dependency but unused. The `--workers` flag is destructured as `workers: _` and discarded. | The full corpus runs at single-file speed. Wall time = sum of per-file times, so no overlap of I/O with compression. | benchmarking / follow-up |
+| G1 | `ingest-all` processes files **sequentially** in a `for` loop (`src/main.rs:187`); `rayon` is a declared dependency but unused. The `--workers` flag is destructured as `workers: _` and discarded. | The full corpus runs at single-file speed. Wall time = sum of per-file times, so no overlap of I/O with compression. | benchmarking / follow-up |
 | G2 | **Fixed on `planning`.** `--resume`/`--overwrite` were parsed but never reached the ingest path: `Cli::overwrite_mode` was never called and `config.overwrite` was never read, so `OverwriteMode` was dead code and `skip_decision` alone drove the skip. `--overwrite` silently skipped; `--resume --overwrite` resolved silently. Now wired through and covered by tests. | — | closed |
 | G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. On 744 files this is the single most likely cause of a partial run. | needs decision |
 | G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | A file whose rows disagree with its filename week range will ingest silently as wrong data. The reconciliation queries in §5 are the only backstop. | needs decision |
 | G5 | `ManifestStatus::InProgress` exists but is never written. | No crash-safe "this file was being written" record. An interrupted run leaves a `.tmp` sibling and no manifest line, so the file is simply re-ingested next pass. Correct, but it means **`*.tmp` files under `data/lake` are the marker of an interrupted run**, and nothing cleans them automatically. | operator step (§4) |
 | G6 | `manifest.jsonl` is append-only and `last_for_path` re-reads the whole file per lookup. | O(records²) per run. At 744 records × a few passes this is seconds, not a problem. Not worth changing before the corpus run; would matter at ~10⁵ sources. | none |
-| G7 | `data/raw` is a symlink to `~/.julia/dev/IRIData/data/IRI/Raw`, which is **dangling on this machine** (`du` reports 0 B). | Nothing runs until the real corpus is staged. See §1. | operator |
+| G7 | **False alarm — corrected.** `data/raw` is a symlink to `~/.julia/dev/IRIData/data/IRI/Raw` and resolves fine; the corpus is staged and measures 140.85 GiB / 744 files / 2.69 B rows. An earlier draft of this table claimed the symlink was "dangling" on the strength of `du -sh data/raw` reporting 0 B. That command reports the *symlink itself*; it does not follow the link. Use `du -shL` or a trailing slash. | none | closed |
 | G8 | `make fixtures` runs `cargo test --test fixtures_emit`, and there is no `tests/fixtures_emit.rs`. | Target fails. Harmless to a corpus run, but it is a broken target in the documented workflow. | trivial fix |
 
 ### The one that actually matters
@@ -38,18 +42,23 @@ the full ingest cannot be committed until G1 is closed and the resulting
 throughput number is measured on real files. **Do not start the full run
 until the `benchmarking` worktree has reported end-to-end file throughput.**
 
-## 1. Stage the corpus to local NVMe
+## 1. Verify the staged corpus
 
-The corpus must be on local NVMe, not on network or spinning storage. The
-runbook assumes a symlink so the repo layout is unchanged.
+The corpus is expected to already be staged on local NVMe (it is, on this
+machine). The runbook assumes a symlink so the repo layout is unchanged.
 
 ```bash
 # Confirm the staged root is real and local before anything else.
 readlink data/raw                       # where it currently points
+[ -e data/raw ] && echo "resolves"      # -e FOLLOWS the symlink
+ls -L data/raw | head                   # -L lists the target, not the link
 df -h "$(readlink data/raw)"            # must be local NVMe, not network
-ls data/raw/Year1                       # must exist
-du -sh data/raw                         # expect ~143 G
+du -shL data/raw                        # expect ~141 GiB (note the -L)
 ```
+
+> Beware: `du -sh data/raw` reports the **symlink itself** and prints `0B`
+> even when the corpus is fully present. Use `du -shL data/raw` or
+> `du -sh data/raw/` (trailing slash), or `test -e`, which follows links.
 
 Record the staging source and destination in the run log. If the corpus is
 ever re-staged, every `source_sha256` in `manifest.jsonl` still matches only
@@ -65,15 +74,41 @@ what we think it sees.
 cargo run --release -- inventory --input data/raw --format json > /tmp/inventory.json
 ```
 
-Check, before going further:
+Check, before going further (measured baseline, from an actual run on the
+staged corpus):
 
-- file count ≈ 744
+- file count ≈ 744 — **confirmed exactly 744**
 - no `skipped[]` entry is a file we expected to ingest (PANEL, stubs,
   `Delivery_Stores`, `DEMOS.CSV` **should** appear here — that is the
   filter working)
-- the `year=` spread covers 1..=12 with no year gaps
+- the `year=` spread covers 1..=12 with no year gaps — **confirmed, all 12
+  years present**
 - category names look like real IRI categories, including the known
   `paptowl` / `paptowls` spelling split
+
+Measured inventory:
+
+```
+ year  channel          files    GiB           rows
+    1 drug             31   0.67       12904698
+    1 groc             31   9.41      180491970
+   ...
+   12 groc             31  11.41      207350429
+
+TOTAL files=744 bytes=140.85 GiB expected_rows=2689259921
+skipped=2733 (top reasons: backup_extension=5, not_sales_filename=468,
+panel_file=1108, stub_or_excel=1152)
+```
+
+The shape is strikingly regular: **31 files per year per channel**,
+12 years × 2 channels × 31 = 744. That uniformity is itself a check — if a
+future inventory shows any year/channel not equal to 31, something is being
+skipped that should not be. The 2733 skips break down as PANEL (1108),
+stub/Excel (1152), non-sales filenames (468) and backups (5), which is the
+expected behaviour of the discovery filter.
+
+**2.69 B rows**, not the 2.7 B quoted in `README.md`; `du` reports 140.85 GiB
+against the "≈143 GB" quoted there (GB vs GiB).
 
 If discovery is wrong, stop. Everything downstream inherits the mistake.
 
@@ -164,8 +199,9 @@ lake is trustworthy, independent of anything the CLI reported.
 SELECT count(*) AS files, sum(written_rows) AS manifest_rows
 FROM read_parquet('data/lake/bronze/iri_sales/**/*.parquet', hive_partitioning = true);
 
--- 5b. Expected total. This is the number the run must land on.
-SELECT (143 * 1024*1024*1024) / 56 AS approx_rows;  -- 2.73 B
+-- 5b. Expected total. This is the number the run must land on: the
+-- inventory's expected_rows for the whole corpus.
+SELECT 2689259921 AS expected_rows;
 
 -- 5c. Coverage: every year/category/channel partition present.
 SELECT year, count(DISTINCT category) AS categories, count(*) AS files
@@ -194,8 +230,8 @@ file-count tolerance, 5d is all zeros, and 5e's per-year week ranges match
 ## 6. Definition of done
 
 - [ ] G1 closed and end-to-end throughput measured on a real 1.3 GB file
-- [ ] Corpus staged on NVMe, path recorded
-- [ ] Gate 1 inventory reviewed, file count ≈ 744
+- [x] Corpus staged on NVMe, path recorded (140.85 GiB, resolves)
+- [x] Gate 1 inventory reviewed — 744 files, 2 689 259 921 rows, all 12 years
 - [ ] Gate 2 validation sweep, zero failures
 - [ ] Gate 3 ramp, each scope with a clean manifest
 - [ ] Gate 4 full run complete, log archived
