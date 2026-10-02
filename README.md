@@ -193,7 +193,8 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
 - `--batch-rows <N>` — rows buffered per flush (default 1 000 000)
 - `--row-group-rows <N>` — Parquet row-group target (default 4 000 000)
 - `--compression <codec>` — `zstd`, `zstd-1`, `zstd-3`, `zstd-9`,
-  `snappy`, `lz4`, `gzip`, `uncompressed` (default `zstd`)
+  `snappy`, `lz4`, `lz4_raw`, `uncompressed` (default `zstd`).
+  Unrecognised codecs warn and fall back to `zstd`.
 - `--worker-threads <N>` — defaults to logical CPU count, capped at 16
 
 ## Resume semantics

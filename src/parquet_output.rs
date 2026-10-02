@@ -34,7 +34,12 @@ pub fn compression_from_config(cfg: &IngestConfig) -> Compression {
         "zstd-9" | "zstd9" => Compression::ZSTD(ZstdLevel::try_new(9).unwrap_or_default()),
         "snappy" => Compression::SNAPPY,
         "lz4" | "lz4_raw" => Compression::LZ4,
-        "gzip" => Compression::GZIP(parquet::basic::GzipLevel::default()),
+        // `gzip` was accepted here but the `parquet` crate is built
+        // without its `flate2` feature, so `Compression::GZIP` fails at
+        // write time with "Disabled feature at compile time: flate2".
+        // It now falls through to the unknown-codec arm below, which
+        // warns and uses zstd — a working default instead of a panic
+        // mid-write.
         "uncompressed" | "none" => Compression::UNCOMPRESSED,
         other => {
             // Unknown codec: default to zstd so a typo in the config
@@ -124,6 +129,22 @@ mod tests {
         ] {
             cfg.compression = c.into();
             let _ = compression_from_config(&cfg);
+        }
+    }
+
+    #[test]
+    fn gzip_and_typos_fall_back_to_zstd() {
+        // `gzip` used to map to Compression::GZIP, which panics at write
+        // time because parquet is built without the `flate2` feature.
+        // It must now behave like any other unusable codec: warn, use zstd.
+        let mut cfg = IngestConfig::for_test();
+        for c in ["gzip", "GZIP", "zst", "brotli"] {
+            cfg.compression = c.into();
+            assert_eq!(
+                compression_from_config(&cfg),
+                Compression::ZSTD(ZstdLevel::default()),
+                "expected {c} to fall back to zstd"
+            );
         }
     }
 
