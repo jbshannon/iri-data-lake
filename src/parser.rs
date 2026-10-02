@@ -493,7 +493,10 @@ mod tests {
     fn parse_uint_range_checks_the_target_type() {
         // A value that fits i64 but not the narrower target.
         assert_eq!(parse_uint::<u16>(b" 65535", "week").unwrap(), 65535);
-        assert!(parse_uint::<u16>(b" 65536", "week").is_err(), "u16 overflow");
+        assert!(
+            parse_uint::<u16>(b" 65536", "week").is_err(),
+            "u16 overflow"
+        );
         assert_eq!(parse_uint::<u8>(b" 255", "ge").unwrap(), 255);
         assert!(parse_uint::<u8>(b" 256", "ge").is_err(), "u8 overflow");
         // Negative into an unsigned target must not wrap.

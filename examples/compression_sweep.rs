@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use arrow_array::RecordBatch;
-use parquet::arrow::ArrowWriter;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::arrow::ArrowWriter;
 
 use iri_lake::arrow_output::schema;
 use iri_lake::config::IngestConfig;
@@ -85,8 +85,7 @@ fn parse_file(path: &Path, batch_rows: usize) -> (Vec<RecordBatch>, u64) {
     while start < total_rows {
         let n = batch_rows.min(total_rows - start);
         let mut b = iri_lake::arrow_output::SalesBuilders::with_capacity(n);
-        parse_records_into_builder(&identity, body, start as u64, n, &mut b)
-            .expect("parse batch");
+        parse_records_into_builder(&identity, body, start as u64, n, &mut b).expect("parse batch");
         out.push(b.finish(schema()).expect("finish batch"));
         start += n;
     }
@@ -101,7 +100,8 @@ fn write_once(batches: &[RecordBatch], cfg: &IngestConfig, out: &Path) -> Durati
     let t = Instant::now();
     {
         let f = std::fs::File::create(out).unwrap();
-        let mut w = ArrowWriter::try_new(std::io::BufWriter::new(f), schema(), Some(props)).unwrap();
+        let mut w =
+            ArrowWriter::try_new(std::io::BufWriter::new(f), schema(), Some(props)).unwrap();
         for b in batches {
             w.write(b).unwrap();
         }
@@ -161,7 +161,9 @@ fn main() {
         for codec in &codecs {
             let mut c = cfg.clone();
             c.compression = codec.clone();
-            let out = scratch.path().join(format!("{}.parquet", codec.replace(['/', '-'], "_")));
+            let out = scratch
+                .path()
+                .join(format!("{}.parquet", codec.replace(['/', '-'], "_")));
 
             // parquet-rs returns Err (and panics internally) when a codec's
             // cargo feature was compiled out. Silence the default hook for
