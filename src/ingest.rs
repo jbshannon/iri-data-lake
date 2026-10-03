@@ -464,6 +464,7 @@ pub fn ingest_all(
         .build()
         .map_err(|e| IngestError::Config(format!("build worker pool: {e}")))?;
 
+    let started_at = Utc::now();
     let started = std::time::Instant::now();
     let results: Vec<Result<IngestOutcome>> = pool.install(|| {
         files
@@ -514,11 +515,72 @@ pub fn ingest_all(
                     error = ?e,
                     "ingest failed"
                 );
+                // Record the failure in the manifest, not just the log.
+                // `manifest.jsonl` is the authoritative record of what
+                // the lake contains; a gap that exists only in stdout is
+                // invisible to anyone auditing the lake afterwards, and
+                // stdout is exactly what a crashed or re-run job loses.
+                let record = failure_record(f, &e, config, started_at);
+                if let Err(write_err) = store.append(&record) {
+                    tracing::error!(
+                        source = %f.identity.path.display(),
+                        error = ?write_err,
+                        "could not record the failure in the manifest"
+                    );
+                }
                 summary.failures.push((f.identity.path.clone(), e));
             }
         }
     }
     Ok(summary)
+}
+
+/// Build the `status: "failed"` manifest record for a source that could
+/// not be ingested.
+///
+/// Two fields are unknowable at this point and say so rather than
+/// guessing: `source_sha256` is empty (hashing either failed or was
+/// never reached) and `written_rows` is 0. Neither can affect a skip
+/// decision, because `skip_decision` only ever honours
+/// `ManifestStatus::Success` — a failed record's job is to make the gap
+/// visible and to be retried, and both are what this does.
+fn failure_record(
+    f: &discovery::DiscoveredFile,
+    error: &IngestError,
+    config: &IngestConfig,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> ManifestRecord {
+    ManifestRecord {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        source_path: f.identity.path.clone(),
+        source_size_bytes: f.size_bytes,
+        source_sha256: String::new(),
+        source_year: f.identity.year,
+        category: f.identity.category.clone(),
+        channel: f.identity.channel,
+        filename_week_start: f.identity.filename_week_start,
+        filename_week_end: f.identity.filename_week_end,
+        expected_rows: fixed_width::expected_rows(f.size_bytes).unwrap_or(0),
+        written_rows: 0,
+        rejected_rows: 0,
+        parser_version: crate::model::PARSER_VERSION.into(),
+        output_schema_version: crate::model::CURRENT_SCHEMA_VERSION,
+        compression: config.compression.clone(),
+        batch_rows: config.batch_rows,
+        row_group_rows: config.parquet_row_group_rows,
+        output_paths: Vec::new(),
+        output_size_bytes: 0,
+        started_at,
+        completed_at: Some(chrono::Utc::now()),
+        duration_ms: Some(
+            Utc::now()
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+        ),
+        status: ManifestStatus::Failed,
+        error_message: Some(error.to_string()),
+    }
 }
 
 #[cfg(test)]

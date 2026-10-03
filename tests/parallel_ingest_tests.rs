@@ -231,6 +231,50 @@ fn a_truncated_trailing_record_is_counted_not_fatal() {
 }
 
 #[test]
+fn a_failed_source_is_recorded_in_the_manifest() {
+    let dir = tempfile::tempdir().unwrap();
+    build_corpus(dir.path(), 3);
+    common::bad_header_fixture(dir.path()); // header is corrupt
+    let inv = discover(dir.path()).unwrap();
+    assert_eq!(inv.files.len(), 4);
+
+    let lake = dir.path().join("lake");
+    let s = ingest_all(&inv.files, dir.path(), &lake, &cfg(), 4).unwrap();
+    assert_eq!(s.completed, 3);
+    assert_eq!(s.failed, 1);
+
+    // The gap is in manifest.jsonl, not only in the log: an auditor
+    // reading the lake can find out what is missing and why.
+    let store = JsonlManifest::open(&lake).unwrap();
+    let all = store.all().unwrap();
+    let failed: Vec<_> = all
+        .iter()
+        .filter(|r| r.status == iri_lake::model::ManifestStatus::Failed)
+        .collect();
+    assert_eq!(failed.len(), 1);
+    let f = failed[0];
+    assert!(f.error_message.as_deref().unwrap().contains("header"));
+    assert_eq!(f.written_rows, 0);
+    assert!(f.output_paths.is_empty());
+
+    // A failed record never matches a skip, so the next run retries it —
+    // and leaves a second failure record rather than pretending the
+    // source is fine.
+    let s2 = ingest_all(&inv.files, dir.path(), &lake, &cfg(), 4).unwrap();
+    assert_eq!(s2.skipped, 3);
+    assert_eq!(s2.failed, 1);
+    assert_eq!(
+        store
+            .all()
+            .unwrap()
+            .iter()
+            .filter(|r| r.status == iri_lake::model::ManifestStatus::Failed)
+            .count(),
+        2
+    );
+}
+
+#[test]
 fn worker_pool_can_be_run_at_several_widths() {
     let dir = tempfile::tempdir().unwrap();
     let paths = build_corpus(dir.path(), 9);
