@@ -39,6 +39,8 @@ help:
 	@echo "  make clean          cargo clean + remove criterion/ and target/"
 	@echo "  make clean-tmp      Delete stale *.tmp leftovers under $(OUT) (older than $(TMP_MAX_AGE_HOURS)h)"
 	@echo "  make readiness      Gated plan for the full 143 GB corpus run"
+	@echo "  make gate5          Reconcile $(LAKE) against its manifest (DuckDB)"
+	@echo "  make sql SQL=...    Run an arbitrary file from sql/ against $(LAKE)"
 
 .PHONY: fmt
 fmt:
@@ -89,6 +91,25 @@ clean:
 clean-tmp:
 	@find $(OUT) -type f -name '*.tmp' -mmin +$$(( $(TMP_MAX_AGE_HOURS) * 60 )) -print -delete 2>/dev/null; \
 		echo "clean-tmp: swept $(OUT) for *.tmp older than $(TMP_MAX_AGE_HOURS)h"
+
+# ---- SQL / analytics layer ---------------------------------------------------
+#
+# DuckDB reads the Parquet lake; nothing in the Rust build depends on it.
+# `uv run` syncs .venv from uv.lock on demand, so there is no separate
+# install step.
+
+LAKE ?= $(OUT)
+SQL  ?= sql/gate5_reconciliation.sql
+
+.PHONY: sql
+sql:
+	uv run python scripts/run_sql.py $(SQL) --lake $(LAKE)
+
+# Gate 5 of docs/corpus_readiness.md. Exits non-zero if any check fails,
+# so it is usable from a script or CI, not just for reading.
+.PHONY: gate5
+gate5:
+	uv run python scripts/run_sql.py sql/gate5_reconciliation.sql --lake $(LAKE)
 
 # ---- Full-corpus run -------------------------------------------------------
 

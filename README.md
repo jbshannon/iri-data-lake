@@ -283,6 +283,27 @@ make bench     # cargo bench --bench parse_sales
 The first build downloads and compiles the Arrow and Parquet
 crates, which is the dominant cost of the dependency graph.
 
+## Querying the lake (DuckDB)
+
+The analytics layer is a `uv` project next to the Rust crate. It is
+strictly downstream: nothing in `cargo build` depends on it, and DuckDB
+simply reads the Parquet files the binary writes.
+
+```bash
+make gate5                       # Gate 5 of docs/corpus_readiness.md
+make gate5 LAKE=/tmp/some-lake   # ...against any other output root
+make sql SQL=sql/my_query.sql    # any file in sql/
+```
+
+`sql/gate5_reconciliation.sql` holds the reconciliation queries; each
+one returns a boolean `gate_5x_ok` column, and `scripts/run_sql.py`
+exits non-zero if any is false, so the gate can be scripted rather than
+eyeballed. `uv run` syncs `.venv` from `uv.lock` on demand — there is no
+install step, and the DuckDB Python package ships no CLI of its own.
+
+Note the DuckDB *shell* (`brew install duckdb`) is a separate thing
+from this project and also works; the queries are plain SQL either way.
+
 ## Safety notes for the full corpus
 
 - The full corpus is **≈ 143 GB raw / 2.7 B rows / 744 sales files**.

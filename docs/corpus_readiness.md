@@ -251,38 +251,44 @@ decision, so a resume re-hashes the whole corpus. Budget for that when
 a run is interrupted.
 
 Reconciliation afterwards. These are the queries that decide whether the
-lake is trustworthy, independent of anything the CLI reported.
+lake is trustworthy, independent of anything the CLI reported. They live
+in [`sql/gate5_reconciliation.sql`](../sql/gate5_reconciliation.sql)
+and are run by:
 
-```sql
--- 5a. Row-count reconciliation, manifest vs disk.
--- Every successful manifest record's written_rows must equal the Parquet
--- file's actual row count.
-SELECT count(*) AS files, sum(written_rows) AS manifest_rows
-FROM read_parquet('data/lake/bronze/iri_sales/**/*.parquet', hive_partitioning = true);
-
--- 5b. Expected total. The inventory figure plus the complete records
--- inside the one non-aligned source; its single truncated record is
--- rejected (counted in rejected_rows) rather than written.
-SELECT 2689259921 + 11391465 AS expected_rows;   -- 2 700 651 386
-
--- 5c. Coverage: every year/category/channel partition present.
-SELECT year, count(DISTINCT category) AS categories, count(*) AS files
-FROM read_parquet('data/lake/bronze/iri_sales/**/*.parquet', hive_partitioning = true)
-GROUP BY year ORDER BY year;
-
--- 5d. Null / sentinel sweep. dollars_cents must never be negative beyond
--- returns; iri_key must never be 0.
-SELECT count(*) FILTER (WHERE iri_key = 0)        AS zero_iri_key,
-       count(*) FILTER (WHERE dollars_cents < 0)  AS negative_dollars,
-       count(*) FILTER (WHERE feature_code > 4)   AS unknown_feature
-FROM read_parquet('data/lake/bronze/iri_sales/**/*.parquet', hive_partitioning = true);
-
--- 5e. Week-range cross-check (the G4 backstop): rows must fall inside the
--- partition's declared week window.
-SELECT year, min(week) AS min_week, max(week) AS max_week, count(*) AS rows
-FROM read_parquet('data/lake/bronze/iri_sales/**/*.parquet', hive_partitioning = true)
-GROUP BY year ORDER BY year;
+```bash
+make gate5                       # against data/lake
+make gate5 LAKE=/tmp/lake-full2  # against any other output root
 ```
+
+Every check returns a boolean column named `gate_5x_ok`, and
+`scripts/run_sql.py` exits non-zero if any of them is false, so this is
+a gate rather than a table to read and judge by eye.
+
+| check | asserts |
+|---|---|
+| **5a** | one manifest record per source, all `success`, no `in_progress`, and `sum(written_rows)` equals the Parquet row count exactly |
+| **5b** | the run lands on **2 700 651 386 rows across 744 successful records** with `rejected_rows = 1` — the inventory's 2 689 259 921 plus the soup file's 11 391 465 complete records |
+| **5c** | 12 years, each with 31 categories and 2 channels on the Parquet side, and 62 sources each on the manifest side |
+| **5d** | `iri_key = 0`, `dollars_cents < 0` and `feature_code > 4` are all zero |
+| **5e** | every year's observed min/max `week` matches `fixed_width::week_to_year`'s table — the G4 backstop, since `week_range_strict` is off |
+
+Three traps in writing these, all hit while writing them:
+
+- **`parquet_metadata()` is per (row group, column).** `sum(row_group_num_rows)`
+  over it returns rows x 11 — I got 29 707 165 246 against 2 700 651 386
+  actual rows, exactly 11x. Use `count(*)` over `read_parquet` for row
+  counts (0.4 s on 2.7 B rows) and `count(DISTINCT file_name)` over
+  `parquet_metadata` for file counts.
+- **A source is not a Parquet file.** One 1.4 GB source becomes many
+  Parquet files, one per 1 M-row batch (232 for Year 1), so "62 files
+  per year" is a statement about the *manifest*, not about
+  `read_parquet`. 5c checks both sides against the right source.
+- **DuckDB's Python package ships no CLI.** `python -m duckdb` fails.
+  That is why Gate 5 runs through `scripts/run_sql.py` rather than the
+  `duckdb` shell the older drafts of this document assumed.
+
+DuckDB is a `uv` project (`pyproject.toml` + `uv.lock`); nothing in the
+Rust build depends on it.
 
 A finished run is one where: no manifest line has `status: "failed"` for a
 file that has not since succeeded (failed lines *are* now written — see
@@ -311,6 +317,10 @@ correction above.
       ~270 s into a scratch root; the production `data/lake` run is still
       to be issued)
 - [ ] Gate 5 queries 5a–5e run and pasted into the run log
+      (`make gate5`; the SQL and the runner are in `sql/` and
+      `scripts/run_sql.py`, and both are verified green against the
+      744-file dry run in `/tmp/lake-full2` — it needs re-running
+      against the production `data/lake`)
 - [ ] README compression list corrected against the enabled Parquet codecs
 - [x] G5 automatic `*.tmp` cleanup (`src/cleanup.rs`, wired into ingest paths)
 - [x] `make fixtures` removed — it referenced a test that never existed
