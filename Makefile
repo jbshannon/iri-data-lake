@@ -52,7 +52,7 @@ clippy:
 
 .PHONY: test
 test:
-	$(BIN) test --all-features
+	$(BIN) test --release --all-features
 
 .PHONY: bench
 bench:
@@ -68,19 +68,19 @@ build:
 
 .PHONY: inventory
 inventory:
-	$(BIN) run -- inventory --input $(IN)
+	$(BIN) run --release -- inventory --input $(IN)
 
 .PHONY: validate
 validate:
-	$(BIN) run -- validate $(FIXTURE_INPUT)
+	$(BIN) run --release -- validate $(FIXTURE_INPUT)
 
 .PHONY: ingest
 ingest:
-	$(BIN) run -- ingest $(FIXTURE_INPUT) --output-root $(OUT)
+	$(BIN) run --release -- ingest $(FIXTURE_INPUT) --output-root $(OUT)
 
 .PHONY: ingest-all
 ingest-all:
-	$(BIN) run -- ingest-all --input $(IN) --output-root $(OUT)
+	$(BIN) run --release -- ingest-all --input $(IN) --output-root $(OUT)
 
 .PHONY: clean
 clean:
