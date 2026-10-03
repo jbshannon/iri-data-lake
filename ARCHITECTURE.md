@@ -329,20 +329,53 @@ The intended shape of a full run is:
 
 - one process per machine (initially),
 - bounded parallelism across files via a worker pool (rayon with a
-  thread count cap; not yet wired through `ingest-all`),
+  thread count cap, wired through `ingest-all --workers`),
 - per file, sequential parsing into Arrow + sequential Parquet write,
-- largest files processed first to reduce tail latency in a
-  multi-hour batch run.
+- the work list dealt **smallest-file-first**, because rayon's
+  work-stealing deque hands work out from the back of the slice — a
+  largest-first list leaves the 1.4 GB file to be picked up last.
 
 We deliberately **do not** combine unrestricted file-level and
 record-level parallelism, because that oversubscribes CPU, memory
 bandwidth, and NVMe queue depth simultaneously. The bench harness
-in `benches/parse_sales.rs` measures the per-file pipeline; once
-that is profiled on a representative file, parallel ingestion across
-files is the right next optimisation.
+in `benches/parse_sales.rs` measures the per-file pipeline;
+parallel ingestion across files is implemented and measured in
+[`docs/parallelism.md`](docs/parallelism.md).
 
-> **Status: not implemented.** `rayon` is a dependency but `ingest-all`
-> still iterates files sequentially, and its `--workers` flag is parsed and
-> discarded. This is tracked as gap G1 in
-> [`docs/corpus_readiness.md`](docs/corpus_readiness.md), which also holds
-> the gated plan for the first full 143 GB corpus run.
+## Parallel ingest (implemented)
+
+```
+┌──────────────────────────────┐
+│ ingest-all (main.rs)         │  discover → filter → largest-first sort
+│  → Order → take_shard        │  → --shard IDX/N (optional)
+└──────────────┬───────────────┘
+               │ Vec<DiscoveredFile>
+               ▼
+┌──────────────────────────────┐
+│ ingest::ingest_all           │  rayon pool, --workers threads
+│  files.par_iter()            │  failures collected, not fatal
+└──────────────┬───────────────┘
+               │ per file, one thread
+               ▼
+┌──────────────────────────────┐
+│ ingest::ingest_file_with     │  unchanged per-file pipeline:
+│  → SharedManifest            │  mmap → header → batch parse → Arrow
+│    (prior lookup / append)   │  → Parquet → atomic rename
+└──────────────────────────────┘
+```
+
+Two design points worth stating explicitly:
+
+1. **The manifest is the only shared mutable state.** Each worker owns
+   its mmap, its Arrow builders, its Parquet writer and its output
+   paths; `SharedManifest` is a mutex over one file handle plus a
+   `HashMap` index, held only for the duration of a single JSONL
+   append. Measured cost across the 743-file corpus run: unmeasurable.
+2. **Failures are values, not panics.** `IngestAllSummary::failures`
+   returns them to the caller and the run continues, so one
+   unparseable source cannot cost the other 743. This is what makes a
+   744-file gate safe to issue unattended.
+
+The measured numbers, the alternatives that were tried (N processes
+with byte-balanced shards, three orderings, worker counts 1–12), and
+the ceiling analysis are in [`docs/parallelism.md`](docs/parallelism.md).

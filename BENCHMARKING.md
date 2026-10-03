@@ -195,8 +195,45 @@ Corpus is 744 files / 140.85 GiB / 2 689 259 921 rows (`inventory`).
 Both bases agree to ~2 %, so the estimate is not sensitive to the
 row-weighting of the corpus. It is a **lower bound**: `ingest-all`
 defaults to `worker_threads = num_cpus()`, which this sweep never
-exercised. Expect roughly 3–5 min at 4–6× scaling, but treat that as an
-inference until someone times `ingest-all` end to end.
+exercised.
+
+**Update (G1, now implemented and measured).** The inference below was
+right, and the measured full-corpus run at `--workers 8
+--order smallest-first` came in at **~270 s** — two runs measured 271 s
+and 406 s, and the 37 % spread is the machine, not the code (a
+same-session `shasum` control fell from 1 544 to 977 MiB/s over the
+same period; normalising the second run against it gives 257 s). The
+run lands **744/744 files, 0 failures, 1 rejected row,
+2 700 651 386 rows, 9.40 GiB of Parquet**. Against a ~17 min
+single-threaded baseline that is **~3.7x**. The four-to-six-x range this
+section guessed at was optimistic because it assumed the CPU would scale
+linearly; it does not, and [`docs/parallelism.md`](docs/parallelism.md)
+§5 shows why: eight concurrent `shasum` processes reach 5.4x on this
+M1, while the full pipeline reaches 3.5x because Parquet's encoding
+layer and the Arrow builders are memory-bound where SHA-256 is not.
+
+| workers | wall (Year-1 scope) | speedup |
+|---:|---:|---:|
+| 1 | 72.8 s | 1.00x |
+| 2 | 39.2 s | 1.86x |
+| 4 | 24.6 s | 2.96x |
+| 8 | 20.3 s | 3.59x |
+| 12 | ~22.7 s | ~3.2x |
+
+Two results from that work are worth carrying into any future
+benchmark: **the work-list order is worth 20 %** (smallest-file-first
+beats the largest-first order this section's design notes used to
+recommend, because rayon hands work out from the back of the deque),
+and **a resume costs a full SHA-256 pass** — re-issuing the command
+against the finished 744-file lake took 110 s to skip all 744.
+
+Finally: the whole measurement session drifted by up to 50 % in
+absolute terms, so **every table here should be read as A/B-within-one-
+session only**, and any cross-session comparison should be normalised
+against the `shasum` control in
+[`docs/parallelism.md`](docs/parallelism.md) §9. That control is
+cheaper than a corpus run and caught a "50 % regression" that was
+entirely the machine.
 
 **Run the whole sweep in one session.** Absolute throughput drifts
 between sessions by up to ~35% on this machine (thermal state, page

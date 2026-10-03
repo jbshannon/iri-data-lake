@@ -178,8 +178,7 @@ iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 
 # Walk the input tree, validate every file, and ingest everything,
-# largest-first, skipping sources already covered by a successful
-# manifest record.
+# skipping sources already covered by a successful manifest record.
 #
 # Skipping is the DEFAULT (no flag needed) — this is what lets an
 # interrupted full-corpus run simply be re-issued.
@@ -188,7 +187,19 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 #   --overwrite   discard existing outputs and rewrite them
 #
 # Passing both is an error: they are opposite intents.
-iri-lake ingest-all --input data/raw --output-root data/lake
+#
+#   --workers N   file-level parallelism (default: available
+#                 parallelism, capped at 16). 1 = sequential.
+#   --order O     work-list order; smallest-first is the default and
+#                 beats largest-first by ~20% (see docs/parallelism.md)
+#   --shard I/N   take a byte-balanced shard of the corpus, for running
+#                 several processes/machines against one output root.
+#
+# A file that fails is logged, counted, and recorded in the manifest
+# as `status: "failed"`; the rest of the run continues. A file whose
+# last record is truncated is NOT a failure: every complete record is
+# ingested and the partial one is counted in `rejected_rows`.
+iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
 iri-lake benchmark data/raw/Year1/beer/beer_drug_1114_1165 \
@@ -203,7 +214,11 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
 - `--compression <codec>` — `zstd`, `zstd-1`, `zstd-3`, `zstd-9`,
 `snappy`, `lz4`, `lz4_raw`, `uncompressed` (default `zstd`).
   Unrecognised codecs warn and fall back to `zstd`.
-- `--worker-threads <N>` — defaults to logical CPU count, capped at 16
+- `--worker-threads <N>` — defaults to logical CPU count, capped at 16;
+  `ingest-all`'s `--workers` overrides it per run
+- `--order <smallest-first|largest-first|striped>` — how `ingest-all`
+  deals its work list to workers. `smallest-first` is the default and is
+  the fastest measured (docs/parallelism.md §3)
 
 ## Resume semantics
 
@@ -218,6 +233,29 @@ A source is skippable only if a prior `manifest.jsonl` entry satisfies
 
 A failed prior run remains visible and is retried on the next
 `ingest` / `ingest-all` (a failed record never matches the skip check).
+
+Note that the source's SHA-256 is computed **before** the skip
+decision, because the hash is what makes the decision trustworthy. A
+resume therefore re-hashes every source: re-issuing the command
+against the finished 744-file corpus took 110 s to skip all 744.
+
+## Partial and failed sources
+
+A source that is not record-aligned — its last record is truncated —
+does not fail the file. Every **complete** record is ingested, the
+trailing partial record is counted in `rejected_rows`, a warning names
+the file, and the manifest records a normal `success`. This exists
+because the staged corpus contains one such file
+(`Year12/soup/soup_groc_1687_1739`: 11 391 465 complete records then
+one truncated), and refusing the whole file would have cost 11.39 M
+good rows to protect one bad record.
+
+A source that genuinely cannot be parsed — a corrupt header, an
+unreadable file — *does* fail. It is logged, counted in the summary,
+and appended to `manifest.jsonl` as `status: "failed"` with its error
+message, so the lake's metadata store records its own gaps instead of
+leaving them in stdout. A failed record never matches a skip, so the
+source is retried on the next run.
 
 When a prior success *does* match, the flag decides what happens:
 
