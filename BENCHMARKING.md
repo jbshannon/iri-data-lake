@@ -199,13 +199,16 @@ exercised.
 
 **Update (G1, now implemented and measured).** The inference below was
 right, and the measured full-corpus run at `--workers 8
---order smallest-first` came in at **~270 s** — two runs measured 271 s
-and 406 s, and the 37 % spread is the machine, not the code (a
-same-session `shasum` control fell from 1 544 to 977 MiB/s over the
-same period; normalising the second run against it gives 257 s). The
-run lands **744/744 files, 0 failures, 1 rejected row,
-2 700 651 386 rows, 9.40 GiB of Parquet**. Against a ~17 min
-single-threaded baseline that is **~3.7x**. The four-to-six-x range this
+--order smallest-first` came in at **~220 s** — two forced
+`--overwrite` runs measured 221.10 s and 220.29 s, agreeing to 0.4 %
+with the same-session `shasum` control flat at 1 443–1 475 MiB/s
+throughout. (The 271 s / 406 s pair quoted in earlier drafts was a hot
+machine: its control had fallen from 1 544 to 977 MiB/s over the same
+period, and normalising the second run against it gives 257 s.) The run
+lands **744/744 files, 0 failures, 1 rejected row, 2 700 651 386 rows,
+9.40 GiB of Parquet from 140.85 GiB raw (15.0x, of which ~3/4 is
+Parquet's encoding layer rather than zstd)**. Against a ~17 min
+single-threaded baseline that is **~4.6x**. The four-to-six-x range this
 section guessed at was optimistic because it assumed the CPU would scale
 linearly; it does not, and [`docs/parallelism.md`](docs/parallelism.md)
 §5 shows why: eight concurrent `shasum` processes reach 5.4x on this

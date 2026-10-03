@@ -188,42 +188,72 @@ left, worth ~10 % of self time), not more threads.
 ## 6. The full corpus, end to end
 
 The number `docs/corpus_readiness.md` §6 gates the run schedule on.
-Two full runs were done, hours apart, and **they disagree by 50 %** —
-which is this machine, not the code, so both are reported:
 
-```
-$ RUST_LOG=iri_lake=info iri-lake ingest-all --input data/raw \
-    --output-root /tmp/lake-full
+### The measurement (2026-10-03, two back-to-back forced runs)
 
-ingest-all: 744 file(s) selected (140.85 GiB raw, ~2.689B rows) of 744 discovered
-ingest-all done: completed=744 skipped=0 failed=0 workers=8 wall=406.12s
-  throughput: raw=355.1 MiB/s rows=6.65 M/s out=9.40 GiB bytes=151236520079
-              rows=2700651386 rejected_rows=1 slowest_file=25.5s
-  note: 1 row(s) rejected as incomplete records (trailing bytes of a truncated source)
-```
+Two **forced** full runs — `--overwrite`, so all 744 files were re-parsed
+and rewritten with no skips, which is the only way to time the whole
+corpus rather than 660 of 744 files — plus a machine-state control
+before and after each, by the §6 method (eight concurrent `shasum -a
+256` over distinct large files):
 
-| | measured |
-|---|---|
-| wall | **271 s** (first run, 743/744 — the one truncated file still refused at the time) / **406 s** (second run, after ~2 h of continuous benchmarking) |
-| aggregate | 530 MiB/s / 355 MiB/s raw; 9.93 / 6.65 M rows/s |
-| output | 9.40 GiB of zstd Parquet (3 148 files) |
-| rows written | **2 700 651 386**, of which `rejected_rows = 1` |
-| failures | 0 — every discovered source is in the lake |
-| stray `*.tmp` | 0 |
+| | run 1 | run 2 |
+|---|---:|---:|
+| wall | **221.10 s** | **220.29 s** |
+| completed / skipped / failed | 744 / 0 / 0 | 744 / 0 / 0 |
+| raw throughput | 652.3 MiB/s | 654.7 MiB/s |
+| rows/s | 12.21 M/s | 12.26 M/s |
+| slowest single file | 13.8 s | 14.1 s |
+| control at that moment | 1 443 MiB/s | 1 446 MiB/s |
 
-The 406 s run is not a regression: the same-session control (eight
-concurrent `shasum -a 256` over distinct 894 MiB files) had fallen
-from **1 544 MiB/s to 977 MiB/s** by the end of the benchmarking day,
-and the slowest *single file* in the run went from 14.4 s to 25.5 s.
-Normalising by that control gives 406 x (977/1544) ≈ **257 s**, which
-agrees with the 271 s measured in a cooler session. **Quote ~270 s
-with a ±50 % band, and re-measure on the day of the real run** — the
-drift is a property of the hardware, and `BENCHMARKING.md` says so.
+Both runs landed `rows=2700651386 rejected_rows=1`, `out=9.40 GiB`, and
+left the lake at 3 148 Parquet files with 0 stray `*.tmp`.
+
+**The two runs agree to 0.4 %, and the control was flat at 1 443–1 475
+MiB/s throughout.** That is the useful result: the wide band in the
+older figures below is not an intrinsic property of this pipeline, it
+was a hot machine. On a cool box this pipeline is repeatable to well
+under a percent, and **~220 s is the number to plan around.**
+
+### The earlier 271 s / 406 s spread, for the record
+
+Two earlier full runs, hours apart, **disagreed by 50 %** — 271 s then
+406 s. That was this machine, not the code: the same-session control
+had fallen from **1 544 MiB/s to 977 MiB/s** by the end of the
+benchmarking day, and the slowest single file went from 14.4 s to
+25.5 s. Normalising by that control gives 406 x (977/1544) ≈ **257 s**,
+agreeing with the 271 s measured in a cooler session.
+
+The 220 s measured above is *faster* than either, and consistently
+so across two runs with a flat control. The 271 s figure came from a
+run that still refused the truncated source (743/744), so it did
+strictly less work; the 406 s figure was measured on a hot box. This
+section does not claim to have isolated why 220 s beats 271 s — the
+honest summary is that **two runs on a cool machine agree to 0.4 %,
+and that is the repeatable number**, while the earlier pair brackets
+what a hot machine does. Re-measure with the control whenever the
+figure is quoted.
 
 Single-threaded the same corpus takes ~17 min (72.8 s per 10.09 GiB
-x 14), so the run is **~3.7x** faster than sequential, at the low end
-of the 4–6x the extrapolation in `BENCHMARKING.md` guessed at, for the
-reason in §5.
+x 14), so the run is **~4.6x** faster than sequential.
+
+### Space
+
+| | bytes | |
+|---|---:|---|
+| raw ingested | 151 236 520 079 | 140.85 GiB, 56 B/row fixed-width |
+| Parquet on disk | 10 096 531 553 | 9.40 GiB, 3 148 files, **3.74 B/row** |
+| ratio | **15.0x** | 133.7 GiB not written |
+| ratio on `du` | 15.2x | raw is 143.09 GiB on disk incl. directory overhead |
+
+**Do not report 15x as "compression."** Per `BENCHMARKING.md` § *Measured
+codec sweep*, most of it is Parquet's dictionary + RLE/bit-packing
+encoding layer, which is always on: a genuinely `UNCOMPRESSED` file
+still measures 5.02 B/row, and the zstd codec itself is 2.5 % of self
+time. The codec's contribution to the 15x is the difference between
+5.02 and 3.74 B/row — roughly a quarter of the ratio. The other
+three quarters is encoding, and would survive `--compression
+uncompressed`.
 
 ### Re-running it (the resume path)
 

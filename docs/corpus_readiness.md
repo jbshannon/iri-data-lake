@@ -27,7 +27,7 @@ another worktree or a decision that has not been made yet.
 
 | # | gap | impact on a full run | owner |
 |---|---|---|---|
-| G1 | **Closed.** `ingest-all` ran files sequentially in a `for` loop; `rayon` was a declared dependency and `--workers` was destructured as `workers: _`. Now: a bounded rayon pool over the file list, one shared lock-serialised manifest, `--order` / `--shard` scheduling flags, and per-file output verified **byte-identical** to the sequential run. Full corpus measured at **~270 s** (271 s and 406 s across two runs; the spread is machine thermal state — see `parallelism.md` §6), was ~17 min sequential. Implementation, measurements and the rejected designs are in [`docs/parallelism.md`](parallelism.md). | — | closed |
+| G1 | **Closed.** `ingest-all` ran files sequentially in a `for` loop; `rayon` was a declared dependency and `--workers` was destructured as `workers: _`. Now: a bounded rayon pool over the file list, one shared lock-serialised manifest, `--order` / `--shard` scheduling flags, and per-file output verified **byte-identical** to the sequential run. Full corpus measured at **~220 s** (two forced runs at 221.10 s and 220.29 s, agreeing to 0.4 % with the machine-state control flat; an earlier 271 s / 406 s pair was a hot machine — see `parallelism.md` §6), was ~17 min sequential. Implementation, measurements and the rejected designs are in [`docs/parallelism.md`](parallelism.md). | — | closed |
 | G2 | **Fixed on `planning`.** `--resume`/`--overwrite` were parsed but never reached the ingest path: `Cli::overwrite_mode` was never called and `config.overwrite` was never read, so `OverwriteMode` was dead code and `skip_decision` alone drove the skip. `--overwrite` silently skipped; `--resume --overwrite` resolved silently. Now wired through and covered by tests. | — | closed |
 | G3 | `UnknownFeaturePolicy::Fail` is hard-coded (`Cli::unknown_feature_policy`), and the config field is not overridable from the CLI. | Any unexpected `F` token fails its whole file. **Decision: keep as-is** — failing loudly on an unexpected `F` token is the right default for a bronze layer, and the manifest records the failure so the run stays resumable. Revisit only if the real corpus turns out to contain such tokens. | accepted |
 | G4 | `week_range_strict` defaults to `false` and is not settable from the CLI. | **Decision: defer.** Assume filename week ranges are recorded correctly for now; add a catch later once testing gives evidence about whether that assumption holds. §5's per-year week-range query stays as a cheap corpus-wide backstop. | deferred |
@@ -39,12 +39,14 @@ another worktree or a decision that has not been made yet.
 ### The one that actually matters
 
 G1 is the difference between a one-night run and a one-week run.
-**Closed and measured**: the full corpus ingests in ~270 s (two runs:
-271 s and 406 s, the difference being machine thermal state, not code —
-normalised, ~257 s) at `--workers 8`, landing **744/744 files, 0
-failures, 1 rejected row, 2 700 651 386 rows**. The schedule for the
-full ingest can now be committed, and it is comfortably inside Gate 4's
-window. Two things moved the number and are now the default:
+**Closed and measured**: the full corpus ingests in **~220 s** at
+`--workers 8`, landing **744/744 files, 0 failures, 1 rejected row,
+2 700 651 386 rows**. Two forced runs measured 221.10 s and 220.29 s —
+agreeing to 0.4 % with the machine-state control flat at
+1 443–1 475 MiB/s — so on a cool box the figure is repeatable rather
+than a band. (An earlier pair of 271 s / 406 s runs was a hot machine;
+see `parallelism.md` §6.) The schedule for the full ingest can now be
+committed. Two things moved the number and are now the default:
 byte-balanced work distribution and **smallest-first** dealing, worth
 20 % over the largest-first ordering `ARCHITECTURE.md` originally
 recommended. See [`docs/parallelism.md`](parallelism.md).
@@ -309,12 +311,17 @@ ingest-all done: completed=744 skipped=0 failed=0 workers=8 wall=406.12s
   note: 1 row(s) rejected as incomplete records (trailing bytes of a truncated source)
 ```
 
-**~270 s — quote it with a wide band.** Two full runs hours apart measured
-271 s and 406 s; the machine itself had slowed by 37 % between them
-(control: eight concurrent `shasum` processes, 1 544 -> 977 MiB/s), and
-the second figure normalises to ~257 s against that control. Against the
-~17 min single-threaded baseline the run is **~3.7x**. 744 files, **0
-failures**, `rejected_rows = 1`, no stray `.tmp` files.
+**~220 s on a cool box; quote the control with it.** Two forced
+`--overwrite` runs back to back measured **221.10 s** and **220.29 s**
+(744 files each, 0 skipped, 0 failed), with the `shasum` control steady
+at 1 443–1 475 MiB/s across both. That 0.4 % agreement is the point:
+the widely-quoted ±50 % band from the earlier 271 s / 406 s pair was a
+hot machine, not a property of the pipeline — that pair is retained in
+`parallelism.md` §6 as the hot-machine bracket. Against the ~17 min
+single-threaded baseline the run is **~4.6x**. 744 files, **0
+failures**, `rejected_rows = 1`, no stray `.tmp` files, and
+**140.85 GiB raw in / 9.40 GiB Parquet out = 15.0x** (of which ~3/4 is
+Parquet encoding rather than zstd).
 
 `rows=2700651386` is the new reconciliation target: the inventory's
 2 689 259 921 plus the soup file's 11 391 465 complete records. Note
@@ -382,8 +389,8 @@ correction above.
 ## 6. Definition of done
 
 - [x] G1 closed and end-to-end throughput measured on the real corpus
-      (~270 s, ±50 % by machine state, 744/744 files, 0 failures —
-      `docs/parallelism.md`)
+      (**~220 s**, two forced runs 0.4 % apart with a flat machine
+      control; 744/744 files, 0 failures — `docs/parallelism.md`)
 - [x] Corpus staged on NVMe, path recorded (140.85 GiB, resolves)
 - [x] Gate 1 inventory reviewed — 744 files, 2 689 259 921 rows, all 12 years
 - [x] Gate 2 validation sweep — **run 2026-10-03: 744 pass, 0 fail,
@@ -395,15 +402,28 @@ correction above.
       records all `success`, 0 failed, 0 `.tmp`; manifest rows equal
       disk rows (317,129,053). The ramp's output is intentionally left
       in place for Gate 4 to resume from.
-- [x] Gate 4 full run complete — **run 2026-10-03** against the
-      production `data/lake`, resuming from Gate 3's 84 files as
-      intended:
+- [x] Gate 4 full run complete — **two forced runs 2026-10-03**, both
+      `--overwrite` with 0 skips so all 744 files were re-parsed:
+      `completed=744 skipped=0 failed=0 workers=8` at **wall=221.10 s**
+      and **wall=220.29 s**, with the `shasum` machine-state control flat
+      at 1 443–1 475 MiB/s throughout. Both landed
+      `rows=2700651386 rejected_rows=1 out=9.40 GiB`, and both left the
+      lake at 9.4 GiB / 3148 Parquet files / one output set per source /
+      0 `.tmp`. Space: **140.85 GiB raw in, 9.40 GiB Parquet out, 15.0x**
+      (3.74 B/row against a fixed 56 B/row), of which ~3/4 of the ratio
+      is Parquet encoding rather than zstd — see `parallelism.md` §6.
+      Gate 5 re-run against the post-overwrite lake: all nine `*_ok`
+      true, exit 0.
+- [x] Gate 4 as a *resume*: **run 2026-10-03** against the production
+      `data/lake`, resuming from Gate 3's 84 files as intended:
       `completed=660 skipped=84 failed=0 workers=8 wall=198.93s`,
-      `rows=2383522333 rejected_rows=1 slowest_file=12.5s`. The lake
-      ends at 9.4 GiB / 3148 Parquet files / 744 manifest records, all
-      `success`, 0 `.tmp`. That run's 2 383 522 333 rows plus the ramp's
-      317 129 053 is the 2 700 651 386 Gate 5b asserts, so the resume
-      path is now measured on the real corpus and not just in tests.
+      `rows=2383522333 rejected_rows=1 slowest_file=12.5s`. That run's
+      2 383 522 333 rows plus the ramp's 317 129 053 is the
+      2 700 651 386 Gate 5b asserts, so the resume path is measured on
+      the real corpus and not just in tests. Note its 198.93 s is *not*
+      comparable to the ~220 s above: it parsed 660 files and skipped 84.
+- [x] `--overwrite` found to leak, fixed, and verified at corpus scale —
+      see decision 7 in §7
 - [x] Gate 5 queries 5a–5e run against the production `data/lake` —
       **all nine `*_ok` columns true**, `run_sql.py` exit 0:
       5a 744 records / 744 success / 0 failed / 0 in_progress,
@@ -503,17 +523,61 @@ correction above.
    recovers it — but if it is ever written, `expected_rows` and
    `written_rows` stop being interchangeable, so the choice is
    deliberate rather than incidental.
+7. **`--overwrite` replaces a source's output set; it does not merely
+   write beside it.** Found on 2026-10-03 while trying to force a full
+   re-run, and it had been wrong since the flag was wired up in G2.
+   `plan_output_paths` embeds the current run's short id in every
+   output filename, so a rewrite can never collide with the prior run's
+   files: the code comment claiming the writer "renames over the
+   existing file" was simply false. One source ingested twice under
+   `--overwrite` left **2 files and 5.0 MB where there should be 1 file
+   and 2.5 MB**. Across the corpus that orphans all 3 148 existing
+   files, doubles the lake, and doubles `count(*)` over the Parquet,
+   while the manifest — append-only — reaches 1 488 records against
+   744 sources. That fails Gate 5 on both 5a ("one record per source,
+   no duplicates") and 5b, and it would have silently broken item 1
+   below, whose remedy is "re-ingest that one source with
+   `--overwrite`".
+
+   Fixed by stashing the prior record's `output_paths` in the Overwrite
+   arm and deleting them **after** the replacement is written *and*
+   appended to the manifest, so an interruption leaves the old output
+   rather than neither. Removal is best-effort like the `.tmp` sweep: a
+   failed unlink logs the orphaned path and does not fail a successful
+   ingest, because failing there would throw away a good row count over
+   an inert file.
+
+   Two things are worth recording about how it survived. The existing
+   test asserted only that the second run *completed with 64 rows*,
+   which is true of a run that leaked too; it now also asserts the lake
+   holds exactly one Parquet file, and reverting the fix fails it with
+   both paths named. And Gates 2–4 had never exercised the path at
+   corpus scale at all, because the overlapping scopes in Gate 3
+   *skipped* rather than overwrote — so "Gate 3 passed clean, so
+   overwrite works" would have been the wrong inference, and the 199 s
+   resume run never touched this code.
+
+   Verified after the fix at corpus scale: two full `--overwrite` runs
+   each left the lake at exactly 3 148 files with 744 distinct run
+   shorts — one output set per source, no orphans.
 
 ### Still open
 
-7. **Re-pull `Year12/soup/soup_groc_1687_1739` from the raw archive.**
+8. **Re-pull `Year12/soup/soup_groc_1687_1739` from the raw archive.**
    Low priority now: the defect is a line terminator, it passes the
    gate, and the lake is not missing any field data (decision 6). If
    the fresh copy is byte-complete, re-ingest that one source with
-   `--overwrite` and re-run Gate 5; the expected total then becomes
-   2 700 651 387 with `rejected_rows = 0`. Until then one row is not
-   written, in one partition, and that fact is recorded in
-   `manifest.jsonl`. Also open: whether a resume should keep
-   re-hashing the whole corpus to make its skip decision (110 s on the
-   finished 744-file lake) or trust size+mtime behind a flag. See
+   `--overwrite` — which now reaps the superseded output rather than
+   leaking it (decision 7) — and re-run Gate 5; the expected total then
+   becomes 2 700 651 387 with `rejected_rows = 0`. Until then one row is
+   not written, in one partition, and that fact is recorded in
+   `manifest.jsonl`.
+
+9. **Should a resume keep re-hashing the whole corpus?** SHA-256 is
+   computed *before* the skip decision, because the hash is what makes
+   the decision trustworthy, so restarting an interrupted run costs
+   ~110 s of a ~220 s run to re-hash 141 GiB and discard it. Trusting
+   size+mtime behind a flag would make resume ~10x cheaper and would
+   weaken the guarantee from "these bytes" to "this inode". This is a
+   change to the idempotence guard, so it wants its own gate. See
    [`docs/parallelism.md`](parallelism.md) §8.
