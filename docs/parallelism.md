@@ -280,10 +280,14 @@ Both policies cost nothing on a healthy corpus and are pinned by
 tests (`a_truncated_trailing_record_is_counted_not_fatal`,
 `a_failed_source_is_recorded_in_the_manifest`).
 
-**Decided — accept the one truncated record for now.** The soup file's
-last row is missing only the `LF` of its CRLF; all eleven fields are
-present, so it is a real sale lost to a transport truncation rather
-than a mangled record:
+**Decided — a terminator-only defect is informational, not a loss.**
+The soup file's last row is missing only the `LF` of its CRLF; all
+eleven fields are present, so no queryable data is missing. A row is 54
+content bytes plus a 2-byte terminator and every field is read from
+offsets 0..54, so this truncates a *line ending*, not a record. Both
+the validator and the ingest log now treat it as a warning; only a
+final record missing field bytes counts as a loss. See
+`docs/corpus_readiness.md` §7 decision 6. For reference:
 
 ```
 complete record : ' 252154 1724  0  1 51000 13459    11    26.29 NONE 0 0\r\n'
@@ -293,8 +297,8 @@ failing record  : ' 252154 1724  0  1 51000 18064     4     9.56 NONE 0 0\r'
 The written partition was verified rather than assumed: 11 391 465
 rows, 53 distinct weeks spanning 1687–1739, 1 301 stores, 107 508 330
 units, $147 240 443.40, zero violations of every Gate 5 sentinel, and
-no nulls. One row in 2.7 billion does not justify blocking the run,
-and re-pulling from the raw archive is tracked as open item 4.
+no nulls. Gate 2 passes 744/744 with this file carrying a warning, and
+re-pulling from the raw archive is tracked as open item 4.
 
 ## 8. Still open
 

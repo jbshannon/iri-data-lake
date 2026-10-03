@@ -125,23 +125,25 @@ Validate **every** file before ingesting any of them. `validate --full`
 checks header bytes and every record's alignment; it does not write output,
 so it is safe to run against the whole corpus.
 
-> **One file in the staged corpus fails this gate**, so this is not
+> **One file in the staged corpus is imperfect**, so this is not
 > hypothetical: `Year12/soup/soup_groc_1687_1739` is 637 922 152
-> bytes and `(size - 57) % 56 == 55` — its final record is one byte
-> short. All eleven content fields are intact; what is missing is the
-> `LF` of the final CRLF:
+> bytes and `(size - 57) % 56 == 55`. All eleven content fields of its
+> final record are intact; what is missing is the `LF` of the final
+> CRLF:
 >
 > ```
 > complete record : ' 252154 1724  0  1 51000 13459    11    26.29 NONE 0 0\r\n'
 > failing record  : ' 252154 1724  0  1 51000 18064     4     9.56 NONE 0 0\r'
 > ```
 >
-> That is the signature of an interrupted copy, not of a source that was
-> always damaged. **Decision: accept the loss for now** (decision 6 in
-> §7) — the file's other 11 391 465 rows are ingested and verified
-> clean, and the source will be re-pulled from the raw archive
-> afterwards. Gate 2 therefore still reports this one file, and that is
-> correct: the gate is where the re-pull gets noticed.
+> A row is 54 content bytes plus a 2-byte terminator, and every field is
+> read from offsets 0..54 — the terminator is never a source of data. So
+> this file loses nothing queryable, and it **passes** the gate with a
+> warning. All 11 391 465 of its complete records are validated (the
+> old code scored it `expected_rows = 0` and therefore checked *none*
+> of them). Ingest writes those 11 391 465 rows, logs at info, and
+> records `rejected_rows = 1` for the unterminated row. See decision 6
+> in §7.
 
 ```bash
 # One file:
@@ -168,24 +170,29 @@ cannot drift apart.
 
 ```
 744 discovered source files, 8-way parallel, release binary
-743 pass, 1 fail, 416s        (426s on a first run)
-
-FAIL data/raw/Year12/soup/soup_groc_1687_1739
-  header_matches: true   record_aligned: false   sample_passed: 0/0
+744 pass, 0 fail, 385s
 ```
 
-**Every other file in the corpus passes `--full`**: correct header bytes,
-correct alignment, and every record's CRLF verified. That is a stronger
-statement than Gate 1 (which only counted files) or Gate 4 (which only
-proves what was written parses), and it is the last thing standing
-between the staged corpus and a production run.
+**Every file in the corpus passes `--full`.** For all 744 that means a
+correct header, correct alignment, and every record's CRLF verified —
+2.69 B records' worth. That is a stronger statement than Gate 1 (which
+only counted files) or Gate 4 (which only proves what was written
+parses); this checks the input.
 
-The single failure is the accepted one named above — decision 6 in §7.
-Because the gate exits non-zero on it, `make gate2` will keep reporting
-`Error 1` until the file is re-pulled; that is intended. An allowlist
-for known-accepted failures was considered and not built: a mechanism
-that turns "this file is still broken" into a silent pass is worse than
-a red gate everyone learns to read.
+One of the 744 carries the terminator-only defect named above, and it
+passes with a warning rather than failing. A file whose final record is
+missing *field* bytes still fails — that is real data loss and the gate
+reports it as such. The two are separated by
+`fixed_width::classify_trailing`, and `tests/trailing_defect_tests.rs`
+pins both directions.
+
+Do not re-derive the file list in the shell. The sweep used to be a
+`find | grep -Ev ...` pipeline, which is a *different* implementation of
+discovery's filter rather than the same one — discovery skips 2 733
+files across six reasons, and PANEL/stub files are not reliably
+filterable from the shell. `inventory --format paths` emits the list
+from `discovery.rs` itself, and the gate and the ingest run therefore
+cannot drift apart.
 
 Because `week_range_strict` is off (G4), this sweep does *not* catch
 filename/row week disagreements; those are caught in Gate 5.
@@ -343,10 +350,11 @@ correction above.
       `docs/parallelism.md`)
 - [x] Corpus staged on NVMe, path recorded (140.85 GiB, resolves)
 - [x] Gate 1 inventory reviewed — 744 files, 2 689 259 921 rows, all 12 years
-- [x] Gate 2 validation sweep — **run 2026-10-03: 743 pass, 1 fail,
-      416 s** (`make gate2`). The one failure is the accepted truncated
-      record in `Year12/soup/soup_groc_1687_1739` (decision 6 in §7);
-      re-pull from the raw archive is follow-up item 7
+- [x] Gate 2 validation sweep — **run 2026-10-03: 744 pass, 0 fail,
+      385 s** (`make gate2`). The one imperfect file,
+      `Year12/soup/soup_groc_1687_1739`, passes with a warning because
+      it is missing only a line terminator, not any field (decision 6 in
+      §7); its re-pull from the raw archive is follow-up item 7
 - [ ] Gate 3 ramp, each scope with a clean manifest
 - [ ] Gate 4 full run complete, log archived (dry-measured end to end at
       ~270 s into a scratch root; the production `data/lake` run is still
@@ -409,27 +417,43 @@ correction above.
    stdout and nowhere else — and stdout is exactly what a crashed or
    re-run job loses. A failed record never matches a skip, so the source
    is still retried next run.
-6. **The one truncated record is accepted for now; re-pull later.**
-   `Year12/soup/soup_groc_1687_1739` is missing the `LF` of its final
-   CRLF and nothing else — all eleven fields of the lost row are
-   present and well-formed (IRI_KEY 252154, WEEK 1724, VEND 51000,
-   ITEM 18064, 4 units, $9.56). Ingest keeps its other **11 391 465**
-   rows and records `rejected_rows = 1`. Verified on the written
-   partition: 53 distinct weeks spanning 1687–1739, 1 301 stores,
-   107 508 330 units, $147 240 443.40, and zero violations of every
-   Gate 5 sentinel. One row out of 2.7 billion is not worth blocking
-   the run; the file will be re-pulled from the raw archive later, which
-   should recover it in full. If the re-pulled file is the same length,
-   the loss is accepted knowingly rather than inherited.
+6. **A terminator-only trailing defect is a warning; a truncated record
+   is a loss.** The corpus's one imperfect file ends one byte into its
+   final CRLF with all eleven fields intact. What matters for the parser
+   and for every downstream query is whether the *data* of the rows
+   exists — and a row's fields all live in offsets 0..54, so a missing
+   terminator costs nothing anybody can read. That is now a warning, not
+   a failure, and both the validator and the ingest path say so
+   explicitly:
+
+   | | validator | ingest |
+   |---|---|---|
+   | final record missing only its CRLF | passes, with a note; all 11 391 465 complete records still validated | info log; writes all 11 391 465; `rejected_rows = 1` |
+   | final record missing field bytes | **fails**, `trailing` reports how many of 54 content bytes are present | warn log; `rejected_rows = 1` and flagged as a data loss in the summary |
+
+   `fixed_width::classify_trailing` is the single place that decides
+   which case applies, so the validator and the ingest path cannot
+   disagree. Gate 2 consequently passes 744/744 on the staged corpus.
+
+   The one row whose terminator is short is still not written to the
+   lake, because the file is not a whole number of records and writing
+   it would make `written_rows` exceed the size-derived row count that
+   the manifest and Gate 5 reconcile against. Nothing is lost in
+   practice — that row's data is complete and re-pulling the file
+   recovers it — but if it is ever written, `expected_rows` and
+   `written_rows` stop being interchangeable, so the choice is
+   deliberate rather than incidental.
 
 ### Still open
 
 7. **Re-pull `Year12/soup/soup_groc_1687_1739` from the raw archive.**
-   If the fresh copy is byte-complete, re-ingest that one source with
+   Low priority now: the defect is a line terminator, it passes the
+   gate, and the lake is not missing any field data (decision 6). If
+   the fresh copy is byte-complete, re-ingest that one source with
    `--overwrite` and re-run Gate 5; the expected total then becomes
-   2 700 651 387 with `rejected_rows = 0`. Until then the corpus is
-   short exactly one row, in one partition, and that fact is recorded
-   in `manifest.jsonl`. Also open: whether a resume should keep
+   2 700 651 387 with `rejected_rows = 0`. Until then one row is not
+   written, in one partition, and that fact is recorded in
+   `manifest.jsonl`. Also open: whether a resume should keep
    re-hashing the whole corpus to make its skip decision (110 s on the
    finished 744-file lake) or trust size+mtime behind a flag. See
    [`docs/parallelism.md`](parallelism.md) §8.

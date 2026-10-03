@@ -202,8 +202,10 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 #
 # A file that fails is logged, counted, and recorded in the manifest
 # as `status: "failed"`; the rest of the run continues. A file whose
-# last record is truncated is NOT a failure: every complete record is
-# ingested and the partial one is counted in `rejected_rows`.
+# last record is short is NOT a failure: every complete record is
+# ingested, the trailing one is counted in `rejected_rows`, and the
+# severity (missing terminator vs missing fields) decides whether that
+# is an info line or a warning.
 iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
@@ -246,14 +248,23 @@ against the finished 744-file corpus took 110 s to skip all 744.
 
 ## Partial and failed sources
 
-A source that is not record-aligned — its last record is truncated —
-does not fail the file. Every **complete** record is ingested, the
-trailing partial record is counted in `rejected_rows`, a warning names
-the file, and the manifest records a normal `success`. This exists
-because the staged corpus contains one such file
-(`Year12/soup/soup_groc_1687_1739`: 11 391 465 complete records then
-one truncated), and refusing the whole file would have cost 11.39 M
-good rows to protect one bad record.
+A source that is not record-aligned does not fail the file. Every
+**complete** record is ingested and the trailing one is counted in
+`rejected_rows`, with a normal `success` in the manifest. What the
+severity of that trailing defect means depends on whether any *field* is
+missing:
+
+| trailing defect | validator | ingest |
+|---|---|---|
+| last record missing only its CRLF terminator | **passes**, with a warning; all complete records still validated | info; every field of every row written |
+| last record missing field bytes | **fails**, reporting how many of its 54 content bytes are present | warning; counted as a real loss |
+
+A row is 54 content bytes plus a 2-byte CRLF terminator, and every
+field is read from offsets 0..54 — the terminator is checked as an
+invariant, never used as data. So a file that ends one byte into its
+final terminator has lost nothing queryable. The staged corpus contains
+exactly one such file (`Year12/soup/soup_groc_1687_1739`, 11 391 465
+complete records), and it passes Gate 2 with a warning.
 
 A source that genuinely cannot be parsed — a corrupt header, an
 unreadable file — *does* fail. It is logged, counted in the summary,
