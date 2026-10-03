@@ -144,24 +144,51 @@ so it is safe to run against the whole corpus.
 > correct: the gate is where the re-pull gets noticed.
 
 ```bash
-# Per file:
-cargo run --release -- validate <path> --full
+# One file:
+./target/release/iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165 --full
 
-# Sweep, recording every failure:
-find data/raw -type f -perm -u+r \
-  | grep -Ev '\.(xls|xlsx|csv|doc|docx|pdf|zip)$' \
-  | grep -v '~\$' \
-  | while read -r f; do
-      cargo run --release -- validate "$f" --full >/dev/null 2>&1 \
-        || echo "FAIL $f"
-    done > /tmp/validate-failures.txt
+# The whole gate:
+make gate2                      # ~7 min on the staged corpus
+scripts/gate2_validate.sh -j 8  # same thing, explicit
 ```
 
-Expected outcome: **zero failures — currently known to be one**, the
-truncated `Year12/soup/soup_groc_1687_1739` named above. A non-empty failure list is the real
-output of this gate — stop and triage before Gate 3. Because
-`week_range_strict` is off (G4), this sweep does *not* catch filename/row
-week disagreements; those are caught in Gate 5.
+Results land in `/tmp/gate2/`: `reports.txt` (one line per file) and
+`failures.txt` (the non-zero exits). The gate exits 1 if anything fails,
+so it is usable from a script.
+
+Do not re-derive the file list in the shell. The sweep used to be a
+`find | grep -Ev ...` pipeline, which is a *different* implementation of
+discovery's filter rather than the same one — discovery skips 2 733
+files across six reasons, and PANEL/stub files are not reliably
+filterable from the shell. `inventory --format paths` emits the list
+from `discovery.rs` itself, and the gate and the ingest run therefore
+cannot drift apart.
+
+### Result on the staged corpus (2026-10-03)
+
+```
+744 discovered source files, 8-way parallel, release binary
+743 pass, 1 fail, 416s        (426s on a first run)
+
+FAIL data/raw/Year12/soup/soup_groc_1687_1739
+  header_matches: true   record_aligned: false   sample_passed: 0/0
+```
+
+**Every other file in the corpus passes `--full`**: correct header bytes,
+correct alignment, and every record's CRLF verified. That is a stronger
+statement than Gate 1 (which only counted files) or Gate 4 (which only
+proves what was written parses), and it is the last thing standing
+between the staged corpus and a production run.
+
+The single failure is the accepted one named above — decision 6 in §7.
+Because the gate exits non-zero on it, `make gate2` will keep reporting
+`Error 1` until the file is re-pulled; that is intended. An allowlist
+for known-accepted failures was considered and not built: a mechanism
+that turns "this file is still broken" into a silent pass is worse than
+a red gate everyone learns to read.
+
+Because `week_range_strict` is off (G4), this sweep does *not* catch
+filename/row week disagreements; those are caught in Gate 5.
 
 ## 4. Gate 3 — the ramp
 
@@ -316,10 +343,10 @@ correction above.
       `docs/parallelism.md`)
 - [x] Corpus staged on NVMe, path recorded (140.85 GiB, resolves)
 - [x] Gate 1 inventory reviewed — 744 files, 2 689 259 921 rows, all 12 years
-- [ ] Gate 2 validation sweep — **one known, accepted failure**
-      (`Year12/soup/soup_groc_1687_1739`, 1 truncated record out of
-      11 391 466; decision 6 in §7. Re-pull from the raw archive is
-      follow-up item 7)
+- [x] Gate 2 validation sweep — **run 2026-10-03: 743 pass, 1 fail,
+      416 s** (`make gate2`). The one failure is the accepted truncated
+      record in `Year12/soup/soup_groc_1687_1739` (decision 6 in §7);
+      re-pull from the raw archive is follow-up item 7
 - [ ] Gate 3 ramp, each scope with a clean manifest
 - [ ] Gate 4 full run complete, log archived (dry-measured end to end at
       ~270 s into a scratch root; the production `data/lake` run is still

@@ -171,6 +171,11 @@ amount.
 # Walk the input tree and report eligible files (does NOT parse them).
 iri-lake inventory --input data/raw
 
+# List exactly which files would be ingested, one per line. This is the
+# supported work list — prefer it to globbing data/raw yourself, since
+# discovery skips 2 733 files across six reasons.
+iri-lake inventory --input data/raw --format paths
+
 # Validate the header, record alignment, and a 100-row sample.
 iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 
@@ -290,6 +295,7 @@ strictly downstream: nothing in `cargo build` depends on it, and DuckDB
 simply reads the Parquet files the binary writes.
 
 ```bash
+make gate2                       # validate every discovered source (~7 min)
 make gate5                       # Gate 5 of docs/corpus_readiness.md
 make gate5 LAKE=/tmp/some-lake   # ...against any other output root
 make sql SQL=sql/my_query.sql    # any file in sql/
