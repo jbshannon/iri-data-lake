@@ -69,12 +69,18 @@ fn run(cli: Cli) -> Result<()> {
             let r = validate_file(&path, &root, sample).context("validate")?;
             print_validation(&r);
             if r.is_ok() {
+                // A benign trailing defect is a warning on a passing
+                // file, not an error: every field of every record is
+                // intact, so there is nothing downstream to act on.
+                if let Some(note) = &r.note {
+                    println!("{note}");
+                }
                 Ok(())
             } else {
                 anyhow::bail!(
-                    "validation failed: header_matches={}, record_aligned={}, sample {}/{}",
+                    "validation failed: header_matches={}, trailing={}, sample {}/{}",
                     r.header_matches,
-                    r.record_aligned,
+                    r.trailing,
                     r.sample_passed,
                     r.sample_size
                 )
@@ -226,6 +232,7 @@ fn run(cli: Cli) -> Result<()> {
                 bytes_out,
                 rows,
                 rejected_rows,
+                rejected_loses_data,
                 wall,
                 slowest_file,
                 failures: _,
@@ -252,10 +259,19 @@ fn run(cli: Cli) -> Result<()> {
                 );
             }
             if rejected_rows > 0 {
-                println!(
-                    "  note: {} row(s) rejected as incomplete records (trailing bytes of a truncated source)",
-                    rejected_rows
-                );
+                if rejected_loses_data {
+                    println!(
+                        "  note: {} trailing record(s) NOT written — the record's data is \
+                         incomplete, so its fields could not be trusted",
+                        rejected_rows
+                    );
+                } else {
+                    println!(
+                        "  note: {} trailing record(s) not written — missing only the line \
+                         terminator; every field of every row is intact",
+                        rejected_rows
+                    );
+                }
             }
             if failed > 0 {
                 tracing::warn!(failed, "ingest-all finished with failures");
@@ -445,7 +461,16 @@ fn print_validation(r: &iri_lake::validation::ValidationReport) {
     println!("size_bytes:  {}", r.size_bytes);
     println!("expected_rows: {}", r.expected_rows);
     println!("header_matches: {}", r.header_matches);
-    println!("record_aligned: {}", r.record_aligned);
+    println!(
+        "record_aligned: {}{}",
+        r.record_aligned,
+        if r.is_aligned() {
+            ""
+        } else {
+            " (trailing defect; see below)"
+        }
+    );
+    println!("trailing:    {}", r.trailing);
     println!("sample_passed:  {}/{}", r.sample_passed, r.sample_size);
 }
 

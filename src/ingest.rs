@@ -30,7 +30,7 @@ use crate::arrow_output::{schema, SalesBuilders};
 use crate::config::{IngestConfig, OverwriteMode};
 use crate::discovery::{self, parse_identity};
 use crate::errors::{IngestError, Result};
-use crate::fixed_width::{self, HEADER_LEN, RECORD_LEN};
+use crate::fixed_width::{self, TrailingDefect, HEADER_LEN, RECORD_LEN};
 use crate::manifest::{skip_decision, SharedManifest};
 use crate::metrics::{sha256_of_file, Timer};
 use crate::model::{
@@ -183,28 +183,45 @@ pub fn ingest_file_with(
     let metadata = std::fs::metadata(path).map_err(|e| IngestError::io(path, e))?;
     let size = metadata.len();
     // A misaligned file is not fatal: ingest every *complete* record and
-    // record the truncated tail in `rejected_rows`. The staged corpus
-    // contains exactly one such file (`Year12/soup/soup_groc_1687_1739`,
-    // last record one byte short); refusing the whole file would cost
-    // 11 391 465 good rows to protect one bad one. A file too short to
-    // hold a header is a different failure and still errors.
-    let (expected_rows, rejected_rows) =
-        fixed_width::split_aligned_records(size).ok_or_else(|| IngestError::RecordAlignment {
+    // record the trailing bytes in `rejected_rows`. Whether that is worth
+    // a warning depends entirely on whether any *field* is affected —
+    // see `fixed_width::TrailingDefect`. A file whose last record is
+    // missing only its CRLF terminator has lost no queryable data (the
+    // staged corpus contains exactly one, `Year12/soup/soup_groc_1687_1739`,
+    // short a single `\n`), so it is logged at info; a record missing
+    // content bytes is a real loss and stays a warning.
+    let alignment =
+        fixed_width::classify_trailing(size).ok_or_else(|| IngestError::RecordAlignment {
             path: path.to_path_buf(),
             size,
             header: HEADER_LEN,
             record: RECORD_LEN,
             remainder: size,
         })?;
-    if rejected_rows > 0 {
-        tracing::warn!(
-            source = %path.display(),
-            size,
-            complete_rows = expected_rows,
-            rejected_rows,
-            trailing_bytes = size.saturating_sub(fixed_width::aligned_prefix_len(size).unwrap_or(0)),
-            "source is not record-aligned; ingesting the complete prefix and rejecting the trailing bytes"
-        );
+    let expected_rows = alignment.complete_rows;
+    let rejected_rows = alignment.rejected_rows;
+    match alignment.defect {
+        TrailingDefect::None => {}
+        defect if defect.is_benign() => {
+            tracing::info!(
+                source = %path.display(),
+                size,
+                complete_rows = expected_rows,
+                rejected_rows,
+                "trailing record is missing only its line terminator; \
+                 every field is intact and all {} records are written",
+                expected_rows
+            );
+        }
+        defect => {
+            tracing::warn!(
+                source = %path.display(),
+                size,
+                complete_rows = expected_rows,
+                rejected_rows,
+                "trailing record is incomplete: {defect}"
+            );
+        }
     }
 
     // ---- 2. SHA-256 -----------------------------------------------------
@@ -365,6 +382,7 @@ pub fn ingest_file_with(
         expected_rows,
         written_rows,
         rejected_rows,
+        rejected_loses_data: alignment.defect.loses_data(),
         output_bytes: total_output_bytes,
         elapsed,
         output_paths: output_paths_written.clone(),
@@ -418,6 +436,9 @@ pub struct IngestAllSummary {
     /// trailing record, which is ingested up to the last aligned
     /// boundary.
     pub rejected_rows: u64,
+    /// True when any rejected record was missing data bytes rather than
+    /// only a line terminator. False for the common benign case.
+    pub rejected_loses_data: bool,
     pub wall: std::time::Duration,
     /// Wall time of the slowest single file's parse+write phase.
     /// Useful as a floor: a run cannot beat this no matter how many
@@ -496,6 +517,7 @@ pub fn ingest_all(
                 summary.bytes_out += stats.output_bytes;
                 summary.rows += stats.written_rows;
                 summary.rejected_rows += stats.rejected_rows;
+                summary.rejected_loses_data |= stats.rejected_rows > 0 && stats.rejected_loses_data;
                 summary.slowest_file = summary.slowest_file.max(stats.elapsed);
                 tracing::info!(
                     source = %f.identity.path.display(),
