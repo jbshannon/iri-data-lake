@@ -14,7 +14,7 @@ use iri_lake::cleanup::{cleanup_stale_tmp, CleanupReport};
 use iri_lake::cli::{Cli, Cmd, OutputFormat};
 use iri_lake::discovery;
 use iri_lake::errors::IngestError;
-use iri_lake::ingest::{ingest_file, IngestFilter, IngestOutcome};
+use iri_lake::ingest::{ingest_all, ingest_file, IngestAllSummary, IngestFilter, IngestOutcome};
 use iri_lake::model::Channel;
 use iri_lake::validation::validate_file;
 
@@ -131,7 +131,9 @@ fn run(cli: Cli) -> Result<()> {
             year,
             category,
             channel,
-            workers: _,
+            workers,
+            order,
+            shard,
         } => {
             let in_root = input.unwrap_or_else(|| config.input_root.clone());
             let out_root = output_root.unwrap_or_else(|| config.output_root.clone());
@@ -160,14 +162,33 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(n) = max_files {
                 files.truncate(n);
             }
+            let workers = workers.or(config.worker_threads).unwrap_or(1).max(1);
+            order.apply(&mut files, workers);
+            if let Some((idx, n)) = shard {
+                files = take_shard(files, idx, n);
+            }
 
+            // Report the *selected* bytes/rows, not the whole
+            // inventory's: with `--shard`, `--year` or `--max-files`
+            // the two differ by an order of magnitude and the old
+            // line made a 4-file shard look like the full corpus.
+            let sel_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+            let sel_rows: u64 = files
+                .iter()
+                .map(|f| iri_lake::fixed_width::expected_rows(f.size_bytes).unwrap_or(0))
+                .sum();
             println!(
-                "ingest-all: discovered {} files ({:.2} GiB raw, ~{:.2}B rows) overwrite={} dry_run={}",
+                "ingest-all: {} file(s) selected ({:.2} GiB raw, ~{:.3}B rows) of {} discovered ({:.2} GiB); overwrite={} dry_run={} workers={} order={} shard={:?}",
                 files.len(),
+                sel_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                sel_rows as f64 / 1e9,
+                inv.total_files(),
                 inv.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                inv.total_expected_rows() as f64 / 1e9,
                 overwrite,
                 dry_run,
+                workers,
+                order,
+                shard,
             );
             if dry_run {
                 for f in files.iter().take(20) {
@@ -185,50 +206,51 @@ fn run(cli: Cli) -> Result<()> {
 
             let _ = sweep_tmp(&out_root, &config);
 
-            let mut completed = 0usize;
-            let mut skipped = 0usize;
-            let mut failed = 0usize;
-            for f in &files {
-                let outcome = match ingest_file(
-                    &f.identity.path,
-                    &in_root,
-                    &out_root,
-                    &config,
-                    &IngestFilter::default(),
-                ) {
-                    Ok(o) => o,
-                    Err(e) => {
-                        failed += 1;
-                        tracing::warn!(
-                            source = %f.identity.path.display(),
-                            error = ?e,
-                            "ingest failed"
-                        );
-                        continue;
-                    }
-                };
-                match outcome {
-                    IngestOutcome::Skipped(_) => {
-                        skipped += 1;
-                    }
-                    IngestOutcome::Completed(_, stats) => {
-                        completed += 1;
-                        tracing::info!(
-                            source = %f.identity.path.display(),
-                            rows = stats.written_rows,
-                            elapsed_s = stats.elapsed.as_secs_f64(),
-                            raw_MiB_s = stats.raw_mib_per_second(),
-                            rows_s = stats.rows_per_second(),
-                            output_bytes = stats.output_bytes,
-                            "ingested",
-                        );
-                    }
-                }
-            }
-            println!(
-                "ingest-all done: completed={} skipped={} failed={}",
-                completed, skipped, failed
+            tracing::info!(
+                workers,
+                order = %order,
+                shard = ?shard,
+                files = files.len(),
+                "ingest-all starting"
             );
+
+            let summary =
+                ingest_all(&files, &in_root, &out_root, &config, workers).context("ingest-all")?;
+
+            let IngestAllSummary {
+                completed,
+                skipped,
+                failed,
+                bytes_in,
+                bytes_out,
+                rows,
+                wall,
+                slowest_file,
+                failures: _,
+            } = summary;
+            let mib = 1024.0 * 1024.0;
+            println!(
+                "ingest-all done: completed={} skipped={} failed={} workers={} wall={:.2}s",
+                completed,
+                skipped,
+                failed,
+                workers,
+                wall.as_secs_f64()
+            );
+            if completed > 0 {
+                println!(
+                    "  throughput: raw={:.1} MiB/s rows={:.2} M/s out={:.2} GiB bytes={} rows={} slowest_file={:.1}s",
+                    bytes_in as f64 / mib / wall.as_secs_f64(),
+                    rows as f64 / 1e6 / wall.as_secs_f64(),
+                    bytes_out as f64 / (1024.0 * 1024.0 * 1024.0),
+                    bytes_in,
+                    rows,
+                    slowest_file.as_secs_f64(),
+                );
+            }
+            if failed > 0 {
+                tracing::warn!(failed, "ingest-all finished with failures");
+            }
             Ok(())
         }
         Cmd::Benchmark {
@@ -277,6 +299,47 @@ fn sweep_tmp(output_root: &Path, config: &iri_lake::config::IngestConfig) -> Cle
         }
     }
     report
+}
+
+/// Take shard `idx` of `n` from a largest-first-sorted file list.
+/// Boundaries are cut on **cumulative bytes**, not on file count. With
+/// a largest-first list the first few files dominate the total, so
+/// equal-count splits are wildly unbalanced (measured: a 4-way
+/// equal-count split of Year 1 left shard 0 with 55% of the bytes and
+/// a makespan 1.5x the whole-run time of an 8-thread pool). Cutting
+/// where the running byte total crosses `idx/n` of the grand total
+/// keeps every shard within one file of `1/n` of the work.
+///
+/// The list is contiguous per shard, so within a shard the same
+/// largest-first property holds for the internal (rayon) split.
+fn take_shard(
+    files: Vec<discovery::DiscoveredFile>,
+    idx: usize,
+    n: usize,
+) -> Vec<discovery::DiscoveredFile> {
+    if n <= 1 || files.is_empty() {
+        return files;
+    }
+    let total: u64 = files.iter().map(|f| f.size_bytes).sum();
+    if total == 0 {
+        return files;
+    }
+    let mut out = Vec::new();
+    let mut cumulative = 0u64;
+    for f in files.into_iter() {
+        let before = cumulative;
+        cumulative += f.size_bytes;
+        // A file belongs to shard `k` where k/total falls in
+        // [before, cumulative): k = floor(before * n / total). A file
+        // bigger than total/n spans several shard boundaries and lands
+        // wholly in the first one it touches — a small imbalance we
+        // accept rather than split a source file across processes.
+        let lo = before * n as u64 / total;
+        if lo == idx as u64 {
+            out.push(f);
+        }
+    }
+    out
 }
 
 fn print_inventory_table(inv: &discovery::Inventory) {

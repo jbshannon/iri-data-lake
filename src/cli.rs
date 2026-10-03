@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{IngestConfig, OverwriteMode, UnknownFeaturePolicy};
+use crate::discovery;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -111,9 +112,22 @@ pub enum Cmd {
         /// Only process this channel.
         #[arg(long)]
         channel: Option<String>,
-        /// Worker threads (defaults to config).
+        /// Worker threads for file-level parallelism. Defaults to
+        /// `config.worker_threads` (available parallelism, capped at
+        /// 16). 1 restores the sequential behaviour.
         #[arg(long)]
         workers: Option<usize>,
+        /// Order in which files are handed to workers.
+        #[arg(long, value_enum, default_value_t = Order::SmallestFirst)]
+        order: Order,
+        /// Ingest only shard `IDX` of `N`, e.g. `--shard 0/4`.
+        ///
+        /// The file list is split into `N` contiguous, largest-first
+        /// chunks of equal total bytes, so each shard carries ~1/N of
+        /// the corpus work. Meant for running several processes over
+        /// one output root — see `docs/parallelism.md`.
+        #[arg(long, value_parser = parse_shard)]
+        shard: Option<(usize, usize)>,
     },
     /// Run parser / Arrow / Parquet micro-benchmarks on one file.
     Benchmark {
@@ -134,10 +148,105 @@ pub enum Cmd {
     },
 }
 
+/// Parse `--shard IDX/N`. Returns `(idx, n)` with `idx < n`.
+fn parse_shard(s: &str) -> Result<(usize, usize), String> {
+    let (a, b) = s
+        .split_once('/')
+        .ok_or_else(|| format!("expected IDX/N, got {s:?}"))?;
+    let idx: usize = a
+        .trim()
+        .parse()
+        .map_err(|_| format!("shard index is not a number: {a:?}"))?;
+    let n: usize = b
+        .trim()
+        .parse()
+        .map_err(|_| format!("shard count is not a number: {b:?}"))?;
+    if n == 0 {
+        return Err("shard count must be >= 1".to_string());
+    }
+    if idx >= n {
+        return Err(format!("shard index {idx} must be < count {n}"));
+    }
+    Ok((idx, n))
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
     Table,
     Json,
+}
+
+/// Scheduling order for `ingest-all`'s work list.
+///
+/// The list is always built largest-file-first; these strategies decide
+/// what to do with that ordering. **The default is `SmallestFirst`**,
+/// which is counter-intuitive and was measured, not guessed: rayon's
+/// work-stealing deque hands work out from the *back* of the slice, so
+/// a largest-first list leaves the 1.4 GB file at index 0 to be picked
+/// up last, by whichever worker happens to be free at the end. On the
+/// Year-1 scope that cost 23% of wall time at 8 workers (24.9 s vs
+/// 20.3 s). See `docs/parallelism.md` for the full table.
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum Order {
+    /// Biggest files first. Worst case for the rayon pool: the largest
+    /// file is reached last.
+    LargestFirst,
+    /// Smallest files first, so the long poles are handed out early by
+    /// the splitting workers and the tail is a pile of short jobs.
+    /// This is the default.
+    SmallestFirst,
+    /// Round-robin over the largest-first list, so the N largest files
+    /// are dealt to N different workers up front. Measures the same as
+    /// `LargestFirst`; kept because it is the intuitive formulation of
+    /// what `SmallestFirst` achieves.
+    Striped,
+}
+
+impl std::fmt::Display for Order {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Order::LargestFirst => "largest-first",
+            Order::SmallestFirst => "smallest-first",
+            Order::Striped => "striped",
+        };
+        f.write_str(s)
+    }
+}
+
+impl Order {
+    /// Re-order a largest-first-sorted file list.
+    ///
+    /// `workers` only matters for [`Order::Striped`].
+    pub fn apply(&self, files: &mut Vec<discovery::DiscoveredFile>, workers: usize) {
+        match self {
+            Order::LargestFirst => {}
+            Order::SmallestFirst => files.reverse(),
+            Order::Striped => stripe(files, workers.max(1)),
+        }
+    }
+}
+
+/// Deal the largest-first list out in strides of `n`: the first `n`
+/// outputs are the n largest files, so each worker starts on a big one
+/// instead of one worker inheriting all of them.
+fn stripe(files: &mut Vec<discovery::DiscoveredFile>, n: usize) {
+    let len = files.len();
+    let mut out: Vec<Option<discovery::DiscoveredFile>> = (0..len).map(|_| None).collect();
+    for (i, f) in files.drain(..).enumerate() {
+        let target = (i / n) * n + (i % n);
+        // For a list shorter than n, or one whose length is not a
+        // multiple of n, `i / n` steps in strides and `target` can run
+        // past the end; fall back to appending in that case.
+        if target < len {
+            out[target] = Some(f);
+        } else {
+            out.push(None);
+            let last = out.len() - 1;
+            out[last] = Some(f);
+        }
+    }
+    // Compact away the `None` holes produced by ragged strides.
+    *files = out.into_iter().flatten().collect();
 }
 
 impl Cli {
