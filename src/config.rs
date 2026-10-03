@@ -15,7 +15,7 @@ pub struct IngestConfig {
     /// `batch_rows`; the writer splits at flush boundaries anyway.
     pub parquet_row_group_rows: usize,
     /// Compression codec name: `zstd`, `zstd-N`, `snappy`, `lz4`,
-    /// `uncompressed`.
+    /// `lz4_raw`, `uncompressed`.
     pub compression: String,
     /// Number of worker threads. `None` = "let rayon decide".
     pub worker_threads: Option<usize>,

@@ -34,7 +34,7 @@ another worktree or a decision that has not been made yet.
 | G5 | **Closed.** Two independent consequences of `ManifestStatus::InProgress` never being written are now handled. **(a) Failures visible only in stdout:** `ingest_all` writes a `status: "failed"` record carrying the error message for any source it could not ingest, so `manifest.jsonl` records its own gaps rather than leaving them in the log — which is exactly what a crashed or re-run job loses. A failed record never matches the skip check, so the source is still retried next run. **(b) Unattended `*.tmp` leftovers:** an interrupted run leaves a `.tmp` sibling with no manifest line, so `src/cleanup.rs` sweeps `*.tmp` under the output root at the start of every `ingest` / `ingest-all`, before anything is written, deleting only those older than 24 h (`--tmp-max-age-hours`, `IRI_LAKE_TMP_MAX_AGE_HOURS`). The age gate means a concurrent run's in-flight `.tmp` is never a candidate, and failures are logged, never fatal. `make clean-tmp` runs the same sweep by hand. (b) landed on `main` first, as `c24e59f`. | — | closed |
 | G6 | **Closed as a side effect of G1.** `manifest.jsonl` was append-only and `last_for_path` re-read the whole file per lookup. | O(records²) per run was never actually a problem at 744 records. `manifest::SharedManifest` now loads the file once into an index and serialises appends behind a mutex, so appends are atomic by construction rather than by `O_APPEND` luck. | closed |
 | G7 | **False alarm — corrected.** `data/raw` is a symlink to `~/.julia/dev/IRIData/data/IRI/Raw` and resolves fine; the corpus is staged and measures 140.85 GiB / 744 files / 2.69 B rows. An earlier draft of this table claimed the symlink was "dangling" on the strength of `du -sh data/raw` reporting 0 B. That command reports the *symlink itself*; it does not follow the link. Use `du -shL` or a trailing slash. | none | closed |
-| G8 | **Fixed on `planning`.** `make fixtures` ran `cargo test --test fixtures_emit`, and there is no `tests/fixtures_emit.rs`. There is also nothing to emit: `tests/common/mod.rs` builds every fixture into a fresh tempdir at test time and no binaries are committed. The target and its help line are removed; `make test` is the entry point. | — | closed |
+| G8 | **Closed upstream in `c24e59f`** (merged via PR #3), which drops the `make fixtures` target. Investigated here before acting on it, and confirmed it was genuinely vestigial rather than merely broken: the test target was deleted after the initial scaffold (`d04540b`), there is no `tests/fixtures/` directory, `.gitignore` never mentions it, no test reads a fixture off disk, and `tests/common/mod.rs` builds every fixture into a fresh tempdir at test time. Re-adding an emitter would have written a directory nothing reads. | — | closed |
 
 ### The one that actually matters
 
@@ -395,17 +395,38 @@ correction above.
       records all `success`, 0 failed, 0 `.tmp`; manifest rows equal
       disk rows (317,129,053). The ramp's output is intentionally left
       in place for Gate 4 to resume from.
-- [ ] Gate 4 full run complete, log archived (dry-measured end to end at
-      ~270 s into a scratch root; the production `data/lake` run is still
-      to be issued)
-- [ ] Gate 5 queries 5a–5e run and pasted into the run log
-      (`make gate5`; the SQL and the runner are in `sql/` and
-      `scripts/run_sql.py`, and both are verified green against the
-      744-file dry run in `/tmp/lake-full2` — it needs re-running
-      against the production `data/lake`)
-- [ ] README compression list corrected against the enabled Parquet codecs
+- [x] Gate 4 full run complete — **run 2026-10-03** against the
+      production `data/lake`, resuming from Gate 3's 84 files as
+      intended:
+      `completed=660 skipped=84 failed=0 workers=8 wall=198.93s`,
+      `rows=2383522333 rejected_rows=1 slowest_file=12.5s`. The lake
+      ends at 9.4 GiB / 3148 Parquet files / 744 manifest records, all
+      `success`, 0 `.tmp`. That run's 2 383 522 333 rows plus the ramp's
+      317 129 053 is the 2 700 651 386 Gate 5b asserts, so the resume
+      path is now measured on the real corpus and not just in tests.
+- [x] Gate 5 queries 5a–5e run against the production `data/lake` —
+      **all nine `*_ok` columns true**, `run_sql.py` exit 0:
+      5a 744 records / 744 success / 0 failed / 0 in_progress,
+      `manifest_rows = disk_rows = 2700651386`, `row_gap = 0`;
+      5b `rejected_rows = 1`; 5c 12 years × 31 categories × 2 channels,
+      62 sources and 62 records per year, 3148 Parquet files;
+      5d `zero_iri_key`/`negative_dollars`/`unknown_feature` all 0;
+      5e every year's observed week range matches
+      `week_to_year` (1114–1165 → year 1 … 1687–1739 → year 12).
+      The independent cross-check 5a cannot make: `inventory` reports
+      2 689 259 921 expected rows, and +11 391 465 for the soup file's
+      complete records is exactly 2 700 651 386.
+- [x] README compression list checked against the enabled Parquet codecs.
+      The list was already correct — all 8 canonical names are accepted by
+      `parquet_output::compression_from_str`, and the lake's 15 433 row
+      groups are uniformly `ZSTD`, matching the documented `zstd` default.
+      The real defect ran the other way: `--compression`'s own help text
+      and `Config::compression`'s doc comment both omitted `lz4_raw`.
+      Fixed in `src/cli.rs` and `src/config.rs`; README additionally
+      documents the `none` synonym and that `zstd` means level 1.
 - [x] G5 automatic `*.tmp` cleanup (`src/cleanup.rs`, wired into ingest paths)
-- [x] `make fixtures` removed — it referenced a test that never existed
+- [x] `make fixtures` removed — it referenced a test that never existed,
+      and nothing read its output (G8)
 - [x] Failure policy decided and implemented: misaligned source = ingest
       the aligned prefix with `rejected_rows`; genuine failure = a
       `status: "failed"` manifest line (decisions 4 and 5 in §7)

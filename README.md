@@ -220,7 +220,13 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
 - `--row-group-rows <N>` — Parquet row-group target (default 4 000 000)
 - `--compression <codec>` — `zstd`, `zstd-1`, `zstd-3`, `zstd-9`,
 `snappy`, `lz4`, `lz4_raw`, `uncompressed` (default `zstd`).
-  Unrecognised codecs warn and fall back to `zstd`.
+  `none` is accepted as a synonym for `uncompressed`. Unrecognised
+  codecs warn and fall back to `zstd`.
+  Note that `zstd` means **level 1**, not level 3 — `zstd` and
+  `zstd-1` produce byte-identical output, and the measured sweep puts
+  level 3 and level 9 at 8 %/44 % less write throughput for 5 %/1 %
+  smaller files, so neither is a good trade
+  ([`BENCHMARKING.md`](BENCHMARKING.md) § *Measured codec sweep*).
 - `--worker-threads <N>` — defaults to logical CPU count, capped at 16;
   `ingest-all`'s `--workers` overrides it per run
 - `--order <smallest-first|largest-first|striped>` — how `ingest-all`
