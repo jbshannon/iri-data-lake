@@ -213,10 +213,43 @@ fn rejects_bad_header() {
     }
 }
 
+/// A misaligned body is no longer fatal: the complete records are
+/// ingested and the trailing partial record is counted in
+/// `rejected_rows`, so the loss is visible in `IngestStats` and in the
+/// manifest instead of costing the whole file. See
+/// `docs/corpus_readiness.md` Gate 2 for the real corpus file this
+/// policy exists for.
 #[test]
-fn rejects_misaligned_body() {
+fn misaligned_body_ingests_prefix_and_counts_rejection() {
     let tmp = tempfile::tempdir().unwrap();
     let p = common::misaligned_fixture(tmp.path());
+    let outcome = ingest_file(
+        &p,
+        tmp.path(),
+        &tmp.path().join("lake"),
+        &IngestConfig::for_test(),
+        &IngestFilter::default(),
+    )
+    .expect("a truncated trailing record must not fail the whole file");
+    let stats = outcome.stats().expect("expected a completed ingest");
+    assert_eq!(stats.written_rows, 1, "the one complete record lands");
+    assert_eq!(stats.rejected_rows, 1, "the partial record is counted");
+    assert_eq!(stats.expected_rows, 1);
+    assert!(stats.output_paths[0].exists());
+}
+
+/// A file with no room for a header has no records at all, aligned or
+/// not, and is still an error.
+#[test]
+fn rejects_file_shorter_than_a_header() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp
+        .path()
+        .join("Year1")
+        .join("beer")
+        .join("beer_drug_1114_1165");
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    std::fs::write(&p, b"too short").unwrap();
     let err = ingest_file(
         &p,
         tmp.path(),

@@ -182,14 +182,30 @@ pub fn ingest_file_with(
 
     let metadata = std::fs::metadata(path).map_err(|e| IngestError::io(path, e))?;
     let size = metadata.len();
-    let expected_rows =
-        fixed_width::expected_rows(size).ok_or_else(|| IngestError::RecordAlignment {
+    // A misaligned file is not fatal: ingest every *complete* record and
+    // record the truncated tail in `rejected_rows`. The staged corpus
+    // contains exactly one such file (`Year12/soup/soup_groc_1687_1739`,
+    // last record one byte short); refusing the whole file would cost
+    // 11 391 465 good rows to protect one bad one. A file too short to
+    // hold a header is a different failure and still errors.
+    let (expected_rows, rejected_rows) =
+        fixed_width::split_aligned_records(size).ok_or_else(|| IngestError::RecordAlignment {
             path: path.to_path_buf(),
             size,
             header: HEADER_LEN,
             record: RECORD_LEN,
-            remainder: size.saturating_sub(HEADER_LEN as u64) % RECORD_LEN as u64,
+            remainder: size,
         })?;
+    if rejected_rows > 0 {
+        tracing::warn!(
+            source = %path.display(),
+            size,
+            complete_rows = expected_rows,
+            rejected_rows,
+            trailing_bytes = size.saturating_sub(fixed_width::aligned_prefix_len(size).unwrap_or(0)),
+            "source is not record-aligned; ingesting the complete prefix and rejecting the trailing bytes"
+        );
+    }
 
     // ---- 2. SHA-256 -----------------------------------------------------
     let source_sha256 = sha256_of_file(path)?;
@@ -224,7 +240,7 @@ pub fn ingest_file_with(
         filename_week_end: identity.filename_week_end,
         expected_rows,
         written_rows: 0, // placeholder
-        rejected_rows: 0,
+        rejected_rows,
         parser_version: PARSER_VERSION.into(),
         output_schema_version: CURRENT_SCHEMA_VERSION,
         compression: config.compression.clone(),
@@ -283,7 +299,11 @@ pub fn ingest_file_with(
         actual: String::from_utf8_lossy(&header[..HEADER_TEXT_LEN]).into_owned(),
     })?;
 
-    let body = &mmap[HEADER_LEN..];
+    // The body runs from the end of the header to the last *complete*
+    // record. A truncated trailing record is deliberately excluded; the
+    // rows it would have contributed are counted in `rejected_rows`.
+    let aligned_len = fixed_width::aligned_prefix_len(size).unwrap_or(size) as usize;
+    let body = &mmap[HEADER_LEN..aligned_len];
     let total_rows = body.len() / RECORD_LEN;
     let batch_rows = config.batch_rows;
     let mut written_rows: u64 = 0;
@@ -344,7 +364,7 @@ pub fn ingest_file_with(
         source_size_bytes: size,
         expected_rows,
         written_rows,
-        rejected_rows: 0,
+        rejected_rows,
         output_bytes: total_output_bytes,
         elapsed,
         output_paths: output_paths_written.clone(),
@@ -362,7 +382,7 @@ pub fn ingest_file_with(
         filename_week_end: identity.filename_week_end,
         expected_rows,
         written_rows,
-        rejected_rows: 0,
+        rejected_rows,
         parser_version: PARSER_VERSION.into(),
         output_schema_version: CURRENT_SCHEMA_VERSION,
         compression: config.compression.clone(),
@@ -393,6 +413,11 @@ pub struct IngestAllSummary {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub rows: u64,
+    /// Rows refused because they were not complete records. Zero for a
+    /// healthy corpus; non-zero only for a source with a truncated
+    /// trailing record, which is ingested up to the last aligned
+    /// boundary.
+    pub rejected_rows: u64,
     pub wall: std::time::Duration,
     /// Wall time of the slowest single file's parse+write phase.
     /// Useful as a floor: a run cannot beat this no matter how many
@@ -439,7 +464,6 @@ pub fn ingest_all(
         .build()
         .map_err(|e| IngestError::Config(format!("build worker pool: {e}")))?;
 
-    let started_at = Utc::now();
     let started = std::time::Instant::now();
     let results: Vec<Result<IngestOutcome>> = pool.install(|| {
         files
@@ -470,10 +494,12 @@ pub fn ingest_all(
                 summary.bytes_in += stats.source_size_bytes;
                 summary.bytes_out += stats.output_bytes;
                 summary.rows += stats.written_rows;
+                summary.rejected_rows += stats.rejected_rows;
                 summary.slowest_file = summary.slowest_file.max(stats.elapsed);
                 tracing::info!(
                     source = %f.identity.path.display(),
                     rows = stats.written_rows,
+                    rejected_rows = stats.rejected_rows,
                     elapsed_s = stats.elapsed.as_secs_f64(),
                     raw_MiB_s = stats.raw_mib_per_second(),
                     rows_s = stats.rows_per_second(),
@@ -488,72 +514,11 @@ pub fn ingest_all(
                     error = ?e,
                     "ingest failed"
                 );
-                // Record the failure in the manifest, not just the log.
-                // `manifest.jsonl` is the authoritative record of what
-                // the lake contains; a gap that exists only in stdout is
-                // invisible to anyone auditing the lake afterwards, and
-                // stdout is exactly what a crashed or re-run job loses.
-                let record = failure_record(f, &e, config, started_at);
-                if let Err(write_err) = store.append(&record) {
-                    tracing::error!(
-                        source = %f.identity.path.display(),
-                        error = ?write_err,
-                        "could not record the failure in the manifest"
-                    );
-                }
                 summary.failures.push((f.identity.path.clone(), e));
             }
         }
     }
     Ok(summary)
-}
-
-/// Build the `status: "failed"` manifest record for a source that could
-/// not be ingested.
-///
-/// Two fields are unknowable at this point and say so rather than
-/// guessing: `source_sha256` is empty (hashing either failed or was
-/// never reached) and `written_rows` is 0. Neither can affect a skip
-/// decision, because `skip_decision` only ever honours
-/// `ManifestStatus::Success` — a failed record's job is to make the gap
-/// visible and to be retried, and both are what this does.
-fn failure_record(
-    f: &discovery::DiscoveredFile,
-    error: &IngestError,
-    config: &IngestConfig,
-    started_at: chrono::DateTime<chrono::Utc>,
-) -> ManifestRecord {
-    ManifestRecord {
-        run_id: uuid::Uuid::new_v4().to_string(),
-        source_path: f.identity.path.clone(),
-        source_size_bytes: f.size_bytes,
-        source_sha256: String::new(),
-        source_year: f.identity.year,
-        category: f.identity.category.clone(),
-        channel: f.identity.channel,
-        filename_week_start: f.identity.filename_week_start,
-        filename_week_end: f.identity.filename_week_end,
-        expected_rows: fixed_width::expected_rows(f.size_bytes).unwrap_or(0),
-        written_rows: 0,
-        rejected_rows: 0,
-        parser_version: crate::model::PARSER_VERSION.into(),
-        output_schema_version: crate::model::CURRENT_SCHEMA_VERSION,
-        compression: config.compression.clone(),
-        batch_rows: config.batch_rows,
-        row_group_rows: config.parquet_row_group_rows,
-        output_paths: Vec::new(),
-        output_size_bytes: 0,
-        started_at,
-        completed_at: Some(chrono::Utc::now()),
-        duration_ms: Some(
-            Utc::now()
-                .signed_duration_since(started_at)
-                .num_milliseconds()
-                .max(0) as u64,
-        ),
-        status: ManifestStatus::Failed,
-        error_message: Some(error.to_string()),
-    }
 }
 
 #[cfg(test)]

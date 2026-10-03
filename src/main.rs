@@ -224,6 +224,7 @@ fn run(cli: Cli) -> Result<()> {
                 bytes_in,
                 bytes_out,
                 rows,
+                rejected_rows,
                 wall,
                 slowest_file,
                 failures: _,
@@ -239,13 +240,20 @@ fn run(cli: Cli) -> Result<()> {
             );
             if completed > 0 {
                 println!(
-                    "  throughput: raw={:.1} MiB/s rows={:.2} M/s out={:.2} GiB bytes={} rows={} slowest_file={:.1}s",
+                    "  throughput: raw={:.1} MiB/s rows={:.2} M/s out={:.2} GiB bytes={} rows={} rejected_rows={} slowest_file={:.1}s",
                     bytes_in as f64 / mib / wall.as_secs_f64(),
                     rows as f64 / 1e6 / wall.as_secs_f64(),
                     bytes_out as f64 / (1024.0 * 1024.0 * 1024.0),
                     bytes_in,
                     rows,
+                    rejected_rows,
                     slowest_file.as_secs_f64(),
+                );
+            }
+            if rejected_rows > 0 {
+                println!(
+                    "  note: {} row(s) rejected as incomplete records (trailing bytes of a truncated source)",
+                    rejected_rows
                 );
             }
             if failed > 0 {

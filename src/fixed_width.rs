@@ -171,6 +171,39 @@ pub fn row_crlf(row: &[u8]) -> Option<&[u8]> {
 ///
 /// Returns `None` if the file is smaller than the header or the body is
 /// not a multiple of `RECORD_LEN`.
+/// Split a file size into (complete records, rejected records).
+///
+/// A well-formed sales file has `HEADER_LEN + n * RECORD_LEN` bytes and
+/// this returns `(n, 0)`. A file whose final record is truncated —
+/// which the staged corpus really contains one of, see
+/// `docs/corpus_readiness.md` Gate 2 — returns the number of whole
+/// records plus the rejected tail: every complete record past the last
+/// aligned boundary, plus the partial one, counted as one.
+///
+/// `None` only for a file too short to hold a header, which is a
+/// different failure (it has no records at all, aligned or not).
+pub fn split_aligned_records(file_size: u64) -> Option<(u64, u64)> {
+    if file_size < HEADER_LEN as u64 {
+        return None;
+    }
+    let body = file_size - HEADER_LEN as u64;
+    let complete = body / RECORD_LEN as u64;
+    let tail = body % RECORD_LEN as u64;
+    let rejected = if tail == 0 {
+        0
+    } else {
+        tail / RECORD_LEN as u64 + 1
+    };
+    Some((complete, rejected))
+}
+
+/// Bytes of a misaligned tail that will *not* be ingested, i.e. the
+/// `file_size` implied by `split_aligned_records`.
+pub fn aligned_prefix_len(file_size: u64) -> Option<u64> {
+    let (complete, _) = split_aligned_records(file_size)?;
+    Some(HEADER_LEN as u64 + complete * RECORD_LEN as u64)
+}
+
 pub fn expected_rows(file_size: u64) -> Option<u64> {
     if file_size < HEADER_LEN as u64 {
         return None;

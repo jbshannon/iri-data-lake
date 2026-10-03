@@ -200,6 +200,37 @@ fn a_bad_source_does_not_abort_the_run() {
 }
 
 #[test]
+fn a_truncated_trailing_record_is_counted_not_fatal() {
+    let dir = tempfile::tempdir().unwrap();
+    build_corpus(dir.path(), 4);
+    // A fifth source with a valid header and one whole record plus a
+    // partial one — the shape of the real `Year12/soup` defect.
+    common::misaligned_fixture(dir.path());
+    let inv = discover(dir.path()).unwrap();
+    assert_eq!(inv.files.len(), 5);
+
+    let lake = dir.path().join("lake");
+    let s = ingest_all(&inv.files, dir.path(), &lake, &cfg(), 4).unwrap();
+    assert_eq!(s.completed, 5, "a truncated tail must not fail the file");
+    assert_eq!(s.failed, 0);
+    assert_eq!(s.rejected_rows, 1);
+
+    // The rejection is in the manifest, on a *successful* record: the
+    // lake has the good rows and the loss is auditable.
+    let store = JsonlManifest::open(&lake).unwrap();
+    let all = store.all().unwrap();
+    assert_eq!(all.len(), 5);
+    let rejected: Vec<_> = all.iter().filter(|r| r.rejected_rows > 0).collect();
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].rejected_rows, 1);
+    assert_eq!(
+        rejected[0].status,
+        iri_lake::model::ManifestStatus::Success,
+        "a partial tail is a successful ingest of the prefix"
+    );
+}
+
+#[test]
 fn worker_pool_can_be_run_at_several_widths() {
     let dir = tempfile::tempdir().unwrap();
     let paths = build_corpus(dir.path(), 9);
