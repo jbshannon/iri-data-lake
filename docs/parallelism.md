@@ -280,6 +280,22 @@ Both policies cost nothing on a healthy corpus and are pinned by
 tests (`a_truncated_trailing_record_is_counted_not_fatal`,
 `a_failed_source_is_recorded_in_the_manifest`).
 
+**Decided — accept the one truncated record for now.** The soup file's
+last row is missing only the `LF` of its CRLF; all eleven fields are
+present, so it is a real sale lost to a transport truncation rather
+than a mangled record:
+
+```
+complete record : ' 252154 1724  0  1 51000 13459    11    26.29 NONE 0 0\r\n'
+failing record  : ' 252154 1724  0  1 51000 18064     4     9.56 NONE 0 0\r'
+```
+
+The written partition was verified rather than assumed: 11 391 465
+rows, 53 distinct weeks spanning 1687–1739, 1 301 stores, 107 508 330
+units, $147 240 443.40, zero violations of every Gate 5 sentinel, and
+no nulls. One row in 2.7 billion does not justify blocking the run,
+and re-pulling from the raw archive is tracked as open item 4.
+
 ## 8. Still open
 
 1. **Hash before skip.** See §6: a resume costs a full SHA-256 pass
@@ -293,6 +309,13 @@ tests (`a_truncated_trailing_record_is_counted_not_fatal`,
 3. **`ManifestStatus::InProgress` is still never written** (G5). A run
    killed mid-file leaves a `*.tmp` sibling and no record, which is
    correct-but-silent. Lower value now that failures *are* recorded.
+4. **Re-pull `Year12/soup/soup_groc_1687_1739`** from the raw archive.
+   Its only defect is a missing final `LF` — every field of the lost
+   row is intact — so a fresh copy has a fair chance of being complete.
+   If it is, re-ingest that one source with `--overwrite` and re-run
+   Gate 5; the expected total becomes 2 700 651 387 with
+   `rejected_rows = 0`. Accepted as-is for now: the file's other
+   11 391 465 rows are in the lake and verified clean.
 
 ## 9. Reproducing
 

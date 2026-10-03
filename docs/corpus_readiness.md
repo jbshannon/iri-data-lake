@@ -128,13 +128,20 @@ so it is safe to run against the whole corpus.
 > **One file in the staged corpus fails this gate**, so this is not
 > hypothetical: `Year12/soup/soup_groc_1687_1739` is 637 922 152
 > bytes and `(size - 57) % 56 == 55` — its final record is one byte
-> short, truncated inside the last field with no CRLF. 11 391 465
-> complete records followed by a partial one. The header bytes are
-> fine, so only the alignment check catches it. Gate 2 still flags it,
-> and that is correct: the *gate* is where you decide whether to
-> re-pull the file from source. The ingest path does not need to — it
-> takes the complete records and records `rejected_rows = 1`
-> (decision 4 in §7).
+> short. All eleven content fields are intact; what is missing is the
+> `LF` of the final CRLF:
+>
+> ```
+> complete record : ' 252154 1724  0  1 51000 13459    11    26.29 NONE 0 0\r\n'
+> failing record  : ' 252154 1724  0  1 51000 18064     4     9.56 NONE 0 0\r'
+> ```
+>
+> That is the signature of an interrupted copy, not of a source that was
+> always damaged. **Decision: accept the loss for now** (decision 6 in
+> §7) — the file's other 11 391 465 rows are ingested and verified
+> clean, and the source will be re-pulled from the raw archive
+> afterwards. Gate 2 therefore still reports this one file, and that is
+> correct: the gate is where the re-pull gets noticed.
 
 ```bash
 # Per file:
@@ -309,9 +316,10 @@ correction above.
       `docs/parallelism.md`)
 - [x] Corpus staged on NVMe, path recorded (140.85 GiB, resolves)
 - [x] Gate 1 inventory reviewed — 744 files, 2 689 259 921 rows, all 12 years
-- [ ] Gate 2 validation sweep — **one known failure**
+- [ ] Gate 2 validation sweep — **one known, accepted failure**
       (`Year12/soup/soup_groc_1687_1739`, 1 truncated record out of
-      11 391 466); decide whether to re-pull it or accept the loss
+      11 391 466; decision 6 in §7. Re-pull from the raw archive is
+      follow-up item 7)
 - [ ] Gate 3 ramp, each scope with a clean manifest
 - [ ] Gate 4 full run complete, log archived (dry-measured end to end at
       ~270 s into a scratch root; the production `data/lake` run is still
@@ -374,15 +382,27 @@ correction above.
    stdout and nowhere else — and stdout is exactly what a crashed or
    re-run job loses. A failed record never matches a skip, so the source
    is still retried next run.
+6. **The one truncated record is accepted for now; re-pull later.**
+   `Year12/soup/soup_groc_1687_1739` is missing the `LF` of its final
+   CRLF and nothing else — all eleven fields of the lost row are
+   present and well-formed (IRI_KEY 252154, WEEK 1724, VEND 51000,
+   ITEM 18064, 4 units, $9.56). Ingest keeps its other **11 391 465**
+   rows and records `rejected_rows = 1`. Verified on the written
+   partition: 53 distinct weeks spanning 1687–1739, 1 301 stores,
+   107 508 330 units, $147 240 443.40, and zero violations of every
+   Gate 5 sentinel. One row out of 2.7 billion is not worth blocking
+   the run; the file will be re-pulled from the raw archive later, which
+   should recover it in full. If the re-pulled file is the same length,
+   the loss is accepted knowingly rather than inherited.
 
 ### Still open
 
-6. **Failure policy residual.** "Log, count and continue" is now
-   explicit and enforced (decisions 4 and 5), with the corpus's one
-   truncated file as the evidence. What remains is an operator step:
-   Gate 2 still surfaces that file, and someone has to accept losing
-   exactly **one row** from it, or go back to the source and re-pull
-   `Year12/soup/soup_groc_1687_1739`. Also open: whether a resume should
-   keep re-hashing the whole corpus to make its skip decision (110 s on
-   the finished 744-file lake) or trust size+mtime behind a flag. See
+7. **Re-pull `Year12/soup/soup_groc_1687_1739` from the raw archive.**
+   If the fresh copy is byte-complete, re-ingest that one source with
+   `--overwrite` and re-run Gate 5; the expected total then becomes
+   2 700 651 387 with `rejected_rows = 0`. Until then the corpus is
+   short exactly one row, in one partition, and that fact is recorded
+   in `manifest.jsonl`. Also open: whether a resume should keep
+   re-hashing the whole corpus to make its skip decision (110 s on the
+   finished 744-file lake) or trust size+mtime behind a flag. See
    [`docs/parallelism.md`](parallelism.md) §8.
