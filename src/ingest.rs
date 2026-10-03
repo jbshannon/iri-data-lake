@@ -23,14 +23,15 @@ use std::path::{Path, PathBuf};
 use arrow_array::RecordBatch;
 use chrono::Utc;
 use memmap2::Mmap;
+use rayon::prelude::*;
 use uuid::Uuid;
 
 use crate::arrow_output::{schema, SalesBuilders};
 use crate::config::{IngestConfig, OverwriteMode};
-use crate::discovery::parse_identity;
+use crate::discovery::{self, parse_identity};
 use crate::errors::{IngestError, Result};
-use crate::fixed_width::{self, HEADER_LEN, RECORD_LEN};
-use crate::manifest::{skip_decision, JsonlManifest, ManifestStore};
+use crate::fixed_width::{self, TrailingDefect, HEADER_LEN, RECORD_LEN};
+use crate::manifest::{skip_decision, SharedManifest};
 use crate::metrics::{sha256_of_file, Timer};
 use crate::model::{
     bronze_root, Channel, IngestStats, ManifestRecord, ManifestStatus, SourceIdentity,
@@ -118,6 +119,29 @@ pub fn ingest_file(
     config: &IngestConfig,
     filter: &IngestFilter,
 ) -> Result<IngestOutcome> {
+    // Single-file callers get a private manifest handle. Parallel
+    // callers (`ingest-all`, G1) pass a shared one instead so that
+    // appends serialise and lookups hit an in-memory index.
+    let store = SharedManifest::open(output_root)?;
+    ingest_file_with(path, input_root, output_root, config, filter, &store)
+}
+
+/// Ingest one source file, appending to a caller-supplied shared
+/// manifest.
+///
+/// Split out from [`ingest_file`] purely so the multi-worker path can
+/// share one [`SharedManifest`] across threads. Everything else about
+/// the pipeline is identical, and `ingest_file` is a thin wrapper that
+/// constructs a private store.
+#[allow(unsafe_code)]
+pub fn ingest_file_with(
+    path: &Path,
+    input_root: &Path,
+    output_root: &Path,
+    config: &IngestConfig,
+    filter: &IngestFilter,
+    store: &SharedManifest,
+) -> Result<IngestOutcome> {
     // ---- 1. Identity & filter -----------------------------------------
     let identity = parse_identity(path, input_root).map_err(|_| {
         IngestError::Discovery(format!(
@@ -158,14 +182,47 @@ pub fn ingest_file(
 
     let metadata = std::fs::metadata(path).map_err(|e| IngestError::io(path, e))?;
     let size = metadata.len();
-    let expected_rows =
-        fixed_width::expected_rows(size).ok_or_else(|| IngestError::RecordAlignment {
+    // A misaligned file is not fatal: ingest every *complete* record and
+    // record the trailing bytes in `rejected_rows`. Whether that is worth
+    // a warning depends entirely on whether any *field* is affected —
+    // see `fixed_width::TrailingDefect`. A file whose last record is
+    // missing only its CRLF terminator has lost no queryable data (the
+    // staged corpus contains exactly one, `Year12/soup/soup_groc_1687_1739`,
+    // short a single `\n`), so it is logged at info; a record missing
+    // content bytes is a real loss and stays a warning.
+    let alignment =
+        fixed_width::classify_trailing(size).ok_or_else(|| IngestError::RecordAlignment {
             path: path.to_path_buf(),
             size,
             header: HEADER_LEN,
             record: RECORD_LEN,
-            remainder: size.saturating_sub(HEADER_LEN as u64) % RECORD_LEN as u64,
+            remainder: size,
         })?;
+    let expected_rows = alignment.complete_rows;
+    let rejected_rows = alignment.rejected_rows;
+    match alignment.defect {
+        TrailingDefect::None => {}
+        defect if defect.is_benign() => {
+            tracing::info!(
+                source = %path.display(),
+                size,
+                complete_rows = expected_rows,
+                rejected_rows,
+                "trailing record is missing only its line terminator; \
+                 every field is intact and all {} records are written",
+                expected_rows
+            );
+        }
+        defect => {
+            tracing::warn!(
+                source = %path.display(),
+                size,
+                complete_rows = expected_rows,
+                rejected_rows,
+                "trailing record is incomplete: {defect}"
+            );
+        }
+    }
 
     // ---- 2. SHA-256 -----------------------------------------------------
     let source_sha256 = sha256_of_file(path)?;
@@ -182,11 +239,15 @@ pub fn ingest_file(
 
     // Skip-or-rewrite semantics. We refuse to overwrite if a prior
     // success record exists but the policy says "Refuse".
-    let store = JsonlManifest::open(output_root)?;
     let prior = store.last_for_path(path)?;
 
     let started_at = Utc::now();
     let timer = Timer::start();
+
+    // Outputs belonging to a prior run of *this* source that an
+    // `--overwrite` is superseding. Populated only in the Overwrite arm
+    // below, and deleted only once the replacement is durably written.
+    let mut prior_outputs_to_remove: Vec<PathBuf> = Vec::new();
 
     // Compose the prospective ManifestRecord so skip_decision() can match.
     let prospective = ManifestRecord {
@@ -201,7 +262,7 @@ pub fn ingest_file(
         filename_week_end: identity.filename_week_end,
         expected_rows,
         written_rows: 0, // placeholder
-        rejected_rows: 0,
+        rejected_rows,
         parser_version: PARSER_VERSION.into(),
         output_schema_version: CURRENT_SCHEMA_VERSION,
         compression: config.compression.clone(),
@@ -224,13 +285,16 @@ pub fn ingest_file(
             OverwriteMode::SkipIfPresent => return Ok(IngestOutcome::Skipped(prior_ok)),
             OverwriteMode::Overwrite => {
                 // Explicitly asked to rewrite: fall through and re-ingest.
-                // The Parquet writer renames over the existing file, so
-                // the output is replaced in place.
                 tracing::info!(
                     source = %path.display(),
                     prior_run = %prior_ok.run_id,
                     "overwriting prior output (--overwrite)"
                 );
+                // `plan_output_paths` embeds *this* run's short id in every
+                // output filename, so the new files cannot collide with the
+                // prior run's and nothing is "replaced in place". Stash the
+                // prior set so it can be reaped once the new one lands.
+                prior_outputs_to_remove = prior_ok.output_paths.clone();
             }
             OverwriteMode::Refuse => {
                 return Err(IngestError::OutputsExist {
@@ -260,7 +324,11 @@ pub fn ingest_file(
         actual: String::from_utf8_lossy(&header[..HEADER_TEXT_LEN]).into_owned(),
     })?;
 
-    let body = &mmap[HEADER_LEN..];
+    // The body runs from the end of the header to the last *complete*
+    // record. A truncated trailing record is deliberately excluded; the
+    // rows it would have contributed are counted in `rejected_rows`.
+    let aligned_len = fixed_width::aligned_prefix_len(size).unwrap_or(size) as usize;
+    let body = &mmap[HEADER_LEN..aligned_len];
     let total_rows = body.len() / RECORD_LEN;
     let batch_rows = config.batch_rows;
     let mut written_rows: u64 = 0;
@@ -321,7 +389,8 @@ pub fn ingest_file(
         source_size_bytes: size,
         expected_rows,
         written_rows,
-        rejected_rows: 0,
+        rejected_rows,
+        rejected_loses_data: alignment.defect.loses_data(),
         output_bytes: total_output_bytes,
         elapsed,
         output_paths: output_paths_written.clone(),
@@ -339,7 +408,7 @@ pub fn ingest_file(
         filename_week_end: identity.filename_week_end,
         expected_rows,
         written_rows,
-        rejected_rows: 0,
+        rejected_rows,
         parser_version: PARSER_VERSION.into(),
         output_schema_version: CURRENT_SCHEMA_VERSION,
         compression: config.compression.clone(),
@@ -355,11 +424,220 @@ pub fn ingest_file(
     };
     store.append(&final_record)?;
 
+    // Reap the superseded output set, and only now: the replacement is
+    // written and recorded, so an interrupted run leaves the old output
+    // in place rather than leaving the source with neither. Best-effort,
+    // like the `.tmp` sweep -- these are inert files, and a failure to
+    // remove one must not fail a successful ingest. It does, however,
+    // silently double that source's footprint, so it is logged.
+    for old in prior_outputs_to_remove {
+        // Defensive: never delete a path this run just wrote.
+        if final_record.output_paths.contains(&old) {
+            continue;
+        }
+        match std::fs::remove_file(&old) {
+            Ok(()) => tracing::debug!(
+                path = %old.display(),
+                "removed output superseded by --overwrite"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %old.display(),
+                error = %e,
+                "failed to remove output superseded by --overwrite; \
+                 it stays in the lake and will double this source's row count"
+            ),
+        }
+    }
+
     Ok(IngestOutcome::Completed(final_record, stats))
 }
 
 // Re-export for the unsafe block above (kept private to this module).
 const HEADER_TEXT_LEN: usize = 55;
+
+/// Outcome of an `ingest-all` run.
+#[derive(Debug, Default)]
+pub struct IngestAllSummary {
+    pub completed: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub rows: u64,
+    /// Rows refused because they were not complete records. Zero for a
+    /// healthy corpus; non-zero only for a source with a truncated
+    /// trailing record, which is ingested up to the last aligned
+    /// boundary.
+    pub rejected_rows: u64,
+    /// True when any rejected record was missing data bytes rather than
+    /// only a line terminator. False for the common benign case.
+    pub rejected_loses_data: bool,
+    pub wall: std::time::Duration,
+    /// Wall time of the slowest single file's parse+write phase.
+    /// Useful as a floor: a run cannot beat this no matter how many
+    /// workers there are.
+    pub slowest_file: std::time::Duration,
+    /// Sources that failed, with their error. The run continues past
+    /// them (documented policy); they are returned so the caller can
+    /// decide whether that was acceptable.
+    pub failures: Vec<(PathBuf, IngestError)>,
+}
+
+/// Ingest every file in `files`, with `workers` rayon threads.
+///
+/// This is the whole of `ingest-all`'s execution; the CLI does
+/// discovery, filtering and reporting around it. Each file is
+/// independent work — mmap, parse, Arrow, Parquet — so the only
+/// shared mutable state is the manifest, funnelled through one
+/// [`SharedManifest`] whose lock is held for the length of a single
+/// JSONL append and nothing else.
+///
+/// `files` is consumed in the order given. The caller is responsible
+/// for the ordering strategy (see `cli::Order`): rayon splits an
+/// indexed slice recursively in half, so *where* the big files sit in
+/// the list determines which worker picks them up and when. Measured
+/// numbers for each ordering are in `docs/parallelism.md`.
+///
+/// Failures are collected, not propagated: one malformed source must
+/// not abandon the other 743. Only a failure to open the manifest or
+/// build the pool returns `Err`.
+pub fn ingest_all(
+    files: &[discovery::DiscoveredFile],
+    input_root: &Path,
+    output_root: &Path,
+    config: &IngestConfig,
+    workers: usize,
+) -> Result<IngestAllSummary> {
+    if workers == 0 {
+        return Err(IngestError::Config("workers must be >= 1".into()));
+    }
+    let store = SharedManifest::open(output_root)?;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|i| format!("iri-lake-{i}"))
+        .build()
+        .map_err(|e| IngestError::Config(format!("build worker pool: {e}")))?;
+
+    let started_at = Utc::now();
+    let started = std::time::Instant::now();
+    let results: Vec<Result<IngestOutcome>> = pool.install(|| {
+        files
+            .par_iter()
+            .map(|f| {
+                ingest_file_with(
+                    &f.identity.path,
+                    input_root,
+                    output_root,
+                    config,
+                    &IngestFilter::default(),
+                    &store,
+                )
+            })
+            .collect()
+    });
+    let wall = started.elapsed();
+
+    let mut summary = IngestAllSummary {
+        wall,
+        ..Default::default()
+    };
+    for (f, r) in files.iter().zip(results) {
+        match r {
+            Ok(IngestOutcome::Skipped(_)) => summary.skipped += 1,
+            Ok(IngestOutcome::Completed(_, stats)) => {
+                summary.completed += 1;
+                summary.bytes_in += stats.source_size_bytes;
+                summary.bytes_out += stats.output_bytes;
+                summary.rows += stats.written_rows;
+                summary.rejected_rows += stats.rejected_rows;
+                summary.rejected_loses_data |= stats.rejected_rows > 0 && stats.rejected_loses_data;
+                summary.slowest_file = summary.slowest_file.max(stats.elapsed);
+                tracing::info!(
+                    source = %f.identity.path.display(),
+                    rows = stats.written_rows,
+                    rejected_rows = stats.rejected_rows,
+                    elapsed_s = stats.elapsed.as_secs_f64(),
+                    raw_MiB_s = stats.raw_mib_per_second(),
+                    rows_s = stats.rows_per_second(),
+                    output_bytes = stats.output_bytes,
+                    "ingested",
+                );
+            }
+            Err(e) => {
+                summary.failed += 1;
+                tracing::warn!(
+                    source = %f.identity.path.display(),
+                    error = ?e,
+                    "ingest failed"
+                );
+                // Record the failure in the manifest, not just the log.
+                // `manifest.jsonl` is the authoritative record of what
+                // the lake contains; a gap that exists only in stdout is
+                // invisible to anyone auditing the lake afterwards, and
+                // stdout is exactly what a crashed or re-run job loses.
+                let record = failure_record(f, &e, config, started_at);
+                if let Err(write_err) = store.append(&record) {
+                    tracing::error!(
+                        source = %f.identity.path.display(),
+                        error = ?write_err,
+                        "could not record the failure in the manifest"
+                    );
+                }
+                summary.failures.push((f.identity.path.clone(), e));
+            }
+        }
+    }
+    Ok(summary)
+}
+
+/// Build the `status: "failed"` manifest record for a source that could
+/// not be ingested.
+///
+/// Two fields are unknowable at this point and say so rather than
+/// guessing: `source_sha256` is empty (hashing either failed or was
+/// never reached) and `written_rows` is 0. Neither can affect a skip
+/// decision, because `skip_decision` only ever honours
+/// `ManifestStatus::Success` — a failed record's job is to make the gap
+/// visible and to be retried, and both are what this does.
+fn failure_record(
+    f: &discovery::DiscoveredFile,
+    error: &IngestError,
+    config: &IngestConfig,
+    started_at: chrono::DateTime<chrono::Utc>,
+) -> ManifestRecord {
+    ManifestRecord {
+        run_id: uuid::Uuid::new_v4().to_string(),
+        source_path: f.identity.path.clone(),
+        source_size_bytes: f.size_bytes,
+        source_sha256: String::new(),
+        source_year: f.identity.year,
+        category: f.identity.category.clone(),
+        channel: f.identity.channel,
+        filename_week_start: f.identity.filename_week_start,
+        filename_week_end: f.identity.filename_week_end,
+        expected_rows: fixed_width::expected_rows(f.size_bytes).unwrap_or(0),
+        written_rows: 0,
+        rejected_rows: 0,
+        parser_version: crate::model::PARSER_VERSION.into(),
+        output_schema_version: crate::model::CURRENT_SCHEMA_VERSION,
+        compression: config.compression.clone(),
+        batch_rows: config.batch_rows,
+        row_group_rows: config.parquet_row_group_rows,
+        output_paths: Vec::new(),
+        output_size_bytes: 0,
+        started_at,
+        completed_at: Some(chrono::Utc::now()),
+        duration_ms: Some(
+            Utc::now()
+                .signed_duration_since(started_at)
+                .num_milliseconds()
+                .max(0) as u64,
+        ),
+        status: ManifestStatus::Failed,
+        error_message: Some(error.to_string()),
+    }
+}
 
 #[cfg(test)]
 mod tests {

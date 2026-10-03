@@ -8,7 +8,7 @@ use std::path::Path;
 
 use crate::discovery::parse_identity;
 use crate::errors::{IngestError, Result};
-use crate::fixed_width::{self, HEADER_LEN, RECORD_LEN};
+use crate::fixed_width::{self, TrailingDefect, HEADER_LEN, RECORD_LEN};
 use crate::model::SourceIdentity;
 
 /// Result of validating a single file.
@@ -18,14 +18,34 @@ pub struct ValidationReport {
     pub size_bytes: u64,
     pub expected_rows: u64,
     pub header_matches: bool,
+    /// Whether the file size is an exact multiple of the record length.
+    ///
+    /// A `false` here is not on its own a failure — see
+    /// [`TrailingDefect`]. A file whose last record is missing only its
+    /// CRLF terminator has lost no field value, and
+    /// [`ValidationReport::is_ok`] says so.
     pub record_aligned: bool,
     pub sample_size: usize,
     pub sample_passed: usize,
+    /// What is wrong with the bytes after the last whole record.
+    pub trailing: TrailingDefect,
+    /// Human-readable note for a benign trailing defect, else `None`.
+    pub note: Option<String>,
 }
 
 impl ValidationReport {
+    /// Whether the file is fit to ingest.
+    ///
+    /// Benign trailing defects pass. A truncated *record* does not: some
+    /// of its fields are missing, so the file is reporting a data loss
+    /// the operator needs to see as a failure.
     pub fn is_ok(&self) -> bool {
-        self.header_matches && self.record_aligned && self.sample_passed == self.sample_size
+        self.header_matches && !self.trailing.loses_data() && self.sample_passed == self.sample_size
+    }
+
+    /// True when the file ends on a whole record.
+    pub fn is_aligned(&self) -> bool {
+        self.trailing == TrailingDefect::None
     }
 }
 
@@ -53,10 +73,29 @@ pub fn validate_file(
         .map_err(|e| IngestError::io(path, e))?;
     let header_matches = fixed_width::validate_header(&header).is_ok();
 
-    let expected_rows = fixed_width::expected_rows(size).unwrap_or(0);
-    let record_aligned = fixed_width::expected_rows(size).is_some();
+    // Classify the tail rather than merely counting whole records. The
+    // count that matters is the number of records we can actually check,
+    // and for a file with a truncated terminator that is every record in
+    // the file — the previous code reported `expected_rows = 0` for the
+    // one real corpus file with this defect, and therefore sampled none
+    // of its 11.4 million records.
+    let alignment = fixed_width::classify_trailing(size);
+    let expected_rows = alignment.map(|a| a.complete_rows).unwrap_or(0);
+    let record_aligned = alignment.map(|a| a.is_aligned()).unwrap_or(false);
+    let trailing = alignment
+        .map(|a| a.defect)
+        .unwrap_or(TrailingDefect::TruncatedRecord { content_bytes: 0 });
+    let note = match trailing {
+        TrailingDefect::None => None,
+        defect if defect.is_benign() => Some(format!(
+            "warning: {} — all {expected_rows} records and every field are intact; \
+             ingest will write the {expected_rows} whole records",
+            defect
+        )),
+        defect => Some(format!("error: {defect}")),
+    };
 
-    // Spot-check sample rows. Each row is RECORD_LEN bytes including CRLF.
+    // Spot-check rows. Each row is RECORD_LEN bytes including CRLF.
     let sample_size = sample.min(expected_rows as usize);
     let mut sample_passed = 0usize;
     let mut body = vec![0u8; RECORD_LEN];
@@ -81,6 +120,8 @@ pub fn validate_file(
         record_aligned,
         sample_size,
         sample_passed,
+        trailing,
+        note,
     })
 }
 

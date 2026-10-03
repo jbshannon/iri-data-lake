@@ -171,6 +171,137 @@ pub fn row_crlf(row: &[u8]) -> Option<&[u8]> {
 ///
 /// Returns `None` if the file is smaller than the header or the body is
 /// not a multiple of `RECORD_LEN`.
+/// What, if anything, is wrong with the bytes after the last whole
+/// record.
+///
+/// The distinction that matters is whether the *data* is complete, not
+/// whether the record is. A row is 54 content bytes plus a 2-byte CRLF
+/// terminator, and field extraction reads only offsets 0..54 — the
+/// terminator is an invariant check, never a source of field bytes. So
+/// a file ending one byte into its final terminator has lost nothing
+/// anybody can query, and is reported as informational rather than
+/// failing the file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrailingDefect {
+    /// The file ends exactly on a record boundary.
+    None,
+    /// The final record's 54 content bytes are all present; only its
+    /// CRLF terminator is short by `missing` bytes (1 or 2). Every field
+    /// of every row is intact.
+    TerminatorOnly {
+        /// Terminator bytes absent: 1 (only `\n`) or 2 (neither).
+        missing: u8,
+    },
+    /// The final record is missing *content* bytes, so one or more of its
+    /// fields are incomplete or absent. Real data loss.
+    TruncatedRecord {
+        /// Content bytes actually present for the final record, 0..54.
+        content_bytes: usize,
+    },
+}
+
+impl TrailingDefect {
+    /// True when no field value is affected — informational only.
+    pub fn is_benign(&self) -> bool {
+        matches!(
+            self,
+            TrailingDefect::None | TrailingDefect::TerminatorOnly { .. }
+        )
+    }
+
+    /// True when a record's data is actually incomplete.
+    pub fn loses_data(&self) -> bool {
+        matches!(self, TrailingDefect::TruncatedRecord { .. })
+    }
+}
+
+impl std::fmt::Display for TrailingDefect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrailingDefect::None => write!(f, "none (file ends on a record boundary)"),
+            TrailingDefect::TerminatorOnly { missing } => write!(
+                f,
+                "final record's CRLF is {missing} byte(s) short; all 54 content bytes present, \
+                 no field affected"
+            ),
+            TrailingDefect::TruncatedRecord { content_bytes } => write!(
+                f,
+                "final record has only {content_bytes}/{} content bytes; fields are incomplete",
+                RECORD_CONTENT_LEN
+            ),
+        }
+    }
+}
+
+/// How a file's size divides into whole records and a trailing defect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Alignment {
+    /// Records that are complete and are ingested.
+    pub complete_rows: u64,
+    /// Trailing records not ingested (0 or 1; a tail of 0..56 bytes
+    /// cannot hold two records).
+    pub rejected_rows: u64,
+    pub defect: TrailingDefect,
+}
+
+impl Alignment {
+    /// True when the file ends exactly on a record boundary.
+    pub fn is_aligned(&self) -> bool {
+        self.defect == TrailingDefect::None
+    }
+
+    /// Whether the trailing defect is informational rather than fatal.
+    pub fn trailing_is_benign(&self) -> bool {
+        self.defect.is_benign()
+    }
+}
+
+/// Split a file size into complete records and a classified tail.
+///
+/// `None` only for a file too short to hold a header, which has no
+/// records at all, aligned or not.
+pub fn classify_trailing(file_size: u64) -> Option<Alignment> {
+    if file_size < HEADER_LEN as u64 {
+        return None;
+    }
+    let body = file_size - HEADER_LEN as u64;
+    let complete_rows = body / RECORD_LEN as u64;
+    let tail = (body % RECORD_LEN as u64) as usize;
+    if tail == 0 {
+        return Some(Alignment {
+            complete_rows,
+            rejected_rows: 0,
+            defect: TrailingDefect::None,
+        });
+    }
+    // The tail is fewer than RECORD_LEN bytes, so it holds at most one
+    // partial record. Within it, bytes 0..RECORD_CONTENT_LEN are the
+    // record's fields; anything past that is terminator.
+    let defect = if tail >= RECORD_CONTENT_LEN {
+        TrailingDefect::TerminatorOnly {
+            missing: (RECORD_LEN - tail) as u8,
+        }
+    } else {
+        TrailingDefect::TruncatedRecord {
+            content_bytes: tail,
+        }
+    };
+    Some(Alignment {
+        complete_rows,
+        rejected_rows: 1,
+        defect,
+    })
+}
+
+/// Bytes of a file that end at the last whole record, i.e. the prefix
+/// that gets ingested. The trailing defect is excluded either way:
+/// `Alignment::rejected_rows` counts it, whether or not the loss is
+/// data-bearing.
+pub fn aligned_prefix_len(file_size: u64) -> Option<u64> {
+    let a = classify_trailing(file_size)?;
+    Some(HEADER_LEN as u64 + a.complete_rows * RECORD_LEN as u64)
+}
+
 pub fn expected_rows(file_size: u64) -> Option<u64> {
     if file_size < HEADER_LEN as u64 {
         return None;
@@ -354,5 +485,61 @@ mod tests {
         assert_eq!(week_to_year(1113), None);
         assert_eq!(week_to_year(1740), None);
         assert_eq!(week_to_year(0), None);
+    }
+
+    #[test]
+    fn classify_trailing_separates_terminator_loss_from_data_loss() {
+        let body = |n: u64| HEADER_LEN as u64 + n * RECORD_LEN as u64;
+
+        // Whole number of records: nothing to classify.
+        let a = classify_trailing(body(10)).unwrap();
+        assert_eq!(a.complete_rows, 10);
+        assert_eq!(a.rejected_rows, 0);
+        assert_eq!(a.defect, TrailingDefect::None);
+        assert!(a.is_aligned());
+        assert!(!a.defect.loses_data());
+
+        // The real corpus file: 54 content bytes + `\r`, missing only
+        // the `\n`. Benign.
+        let a = classify_trailing(body(10) + 55).unwrap();
+        assert_eq!(a.defect, TrailingDefect::TerminatorOnly { missing: 1 });
+        assert!(a.defect.is_benign());
+        assert!(!a.defect.loses_data());
+        assert_eq!(a.complete_rows, 10);
+        assert_eq!(a.rejected_rows, 1);
+        assert!(!a.is_aligned());
+
+        // Both terminator bytes absent: still benign, still complete data.
+        let a = classify_trailing(body(10) + 54).unwrap();
+        assert_eq!(a.defect, TrailingDefect::TerminatorOnly { missing: 2 });
+        assert!(a.defect.is_benign());
+
+        // Data bytes missing: a real loss. (`present = 0` is the aligned
+        // case above, not a zero-length partial record.)
+        for present in [1u64, 2, 27, 53] {
+            let a = classify_trailing(body(10) + present).unwrap();
+            assert_eq!(
+                a.defect,
+                TrailingDefect::TruncatedRecord {
+                    content_bytes: present as usize
+                },
+                "tail of {present} bytes should be a data-losing defect"
+            );
+            assert!(a.defect.loses_data());
+            assert!(!a.defect.is_benign());
+        }
+
+        // A file too short for a header has no records at all.
+        assert!(classify_trailing(HEADER_LEN as u64 - 1).is_none());
+    }
+
+    #[test]
+    fn aligned_prefix_ends_at_the_last_whole_record() {
+        let body = 10 * RECORD_LEN as u64;
+        let full = HEADER_LEN as u64 + body;
+        assert_eq!(aligned_prefix_len(full), Some(full));
+        // One byte of a truncated terminator does not extend the prefix.
+        assert_eq!(aligned_prefix_len(full + 55), Some(full));
+        assert_eq!(aligned_prefix_len(full + 20), Some(full));
     }
 }

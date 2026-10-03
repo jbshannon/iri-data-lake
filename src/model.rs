@@ -169,6 +169,10 @@ pub struct IngestStats {
     pub expected_rows: u64,
     pub written_rows: u64,
     pub rejected_rows: u64,
+    /// True when the rejected trailing record was missing *data* bytes,
+    /// as opposed to only its line terminator. Only that case is a real
+    /// loss; see `fixed_width::TrailingDefect`.
+    pub rejected_loses_data: bool,
     pub output_bytes: u64,
     pub elapsed: std::time::Duration,
     pub output_paths: Vec<PathBuf>,

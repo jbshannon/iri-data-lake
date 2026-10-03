@@ -171,6 +171,11 @@ amount.
 # Walk the input tree and report eligible files (does NOT parse them).
 iri-lake inventory --input data/raw
 
+# List exactly which files would be ingested, one per line. This is the
+# supported work list — prefer it to globbing data/raw yourself, since
+# discovery skips 2 733 files across six reasons.
+iri-lake inventory --input data/raw --format paths
+
 # Validate the header, record alignment, and a 100-row sample.
 iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 
@@ -178,8 +183,7 @@ iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 
 # Walk the input tree, validate every file, and ingest everything,
-# largest-first, skipping sources already covered by a successful
-# manifest record.
+# skipping sources already covered by a successful manifest record.
 #
 # Skipping is the DEFAULT (no flag needed) — this is what lets an
 # interrupted full-corpus run simply be re-issued.
@@ -188,7 +192,21 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 #   --overwrite   discard existing outputs and rewrite them
 #
 # Passing both is an error: they are opposite intents.
-iri-lake ingest-all --input data/raw --output-root data/lake
+#
+#   --workers N   file-level parallelism (default: available
+#                 parallelism, capped at 16). 1 = sequential.
+#   --order O     work-list order; smallest-first is the default and
+#                 beats largest-first by ~20% (see docs/parallelism.md)
+#   --shard I/N   take a byte-balanced shard of the corpus, for running
+#                 several processes/machines against one output root.
+#
+# A file that fails is logged, counted, and recorded in the manifest
+# as `status: "failed"`; the rest of the run continues. A file whose
+# last record is short is NOT a failure: every complete record is
+# ingested, the trailing one is counted in `rejected_rows`, and the
+# severity (missing terminator vs missing fields) decides whether that
+# is an info line or a warning.
+iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
 iri-lake benchmark data/raw/Year1/beer/beer_drug_1114_1165 \
@@ -202,8 +220,18 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
 - `--row-group-rows <N>` — Parquet row-group target (default 4 000 000)
 - `--compression <codec>` — `zstd`, `zstd-1`, `zstd-3`, `zstd-9`,
 `snappy`, `lz4`, `lz4_raw`, `uncompressed` (default `zstd`).
-  Unrecognised codecs warn and fall back to `zstd`.
-- `--worker-threads <N>` — defaults to logical CPU count, capped at 16
+  `none` is accepted as a synonym for `uncompressed`. Unrecognised
+  codecs warn and fall back to `zstd`.
+  Note that `zstd` means **level 1**, not level 3 — `zstd` and
+  `zstd-1` produce byte-identical output, and the measured sweep puts
+  level 3 and level 9 at 8 %/44 % less write throughput for 5 %/1 %
+  smaller files, so neither is a good trade
+  ([`BENCHMARKING.md`](BENCHMARKING.md) § *Measured codec sweep*).
+- `--worker-threads <N>` — defaults to logical CPU count, capped at 16;
+  `ingest-all`'s `--workers` overrides it per run
+- `--order <smallest-first|largest-first|striped>` — how `ingest-all`
+  deals its work list to workers. `smallest-first` is the default and is
+  the fastest measured (docs/parallelism.md §3)
 
 ## Resume semantics
 
@@ -218,6 +246,38 @@ A source is skippable only if a prior `manifest.jsonl` entry satisfies
 
 A failed prior run remains visible and is retried on the next
 `ingest` / `ingest-all` (a failed record never matches the skip check).
+
+Note that the source's SHA-256 is computed **before** the skip
+decision, because the hash is what makes the decision trustworthy. A
+resume therefore re-hashes every source: re-issuing the command
+against the finished 744-file corpus took 110 s to skip all 744.
+
+## Partial and failed sources
+
+A source that is not record-aligned does not fail the file. Every
+**complete** record is ingested and the trailing one is counted in
+`rejected_rows`, with a normal `success` in the manifest. What the
+severity of that trailing defect means depends on whether any *field* is
+missing:
+
+| trailing defect | validator | ingest |
+|---|---|---|
+| last record missing only its CRLF terminator | **passes**, with a warning; all complete records still validated | info; every field of every row written |
+| last record missing field bytes | **fails**, reporting how many of its 54 content bytes are present | warning; counted as a real loss |
+
+A row is 54 content bytes plus a 2-byte CRLF terminator, and every
+field is read from offsets 0..54 — the terminator is checked as an
+invariant, never used as data. So a file that ends one byte into its
+final terminator has lost nothing queryable. The staged corpus contains
+exactly one such file (`Year12/soup/soup_groc_1687_1739`, 11 391 465
+complete records), and it passes Gate 2 with a warning.
+
+A source that genuinely cannot be parsed — a corrupt header, an
+unreadable file — *does* fail. It is logged, counted in the summary,
+and appended to `manifest.jsonl` as `status: "failed"` with its error
+message, so the lake's metadata store records its own gaps instead of
+leaving them in stdout. A failed record never matches a skip, so the
+source is retried on the next run.
 
 When a prior success *does* match, the flag decides what happens:
 
@@ -244,6 +304,28 @@ make bench     # cargo bench --bench parse_sales
 
 The first build downloads and compiles the Arrow and Parquet
 crates, which is the dominant cost of the dependency graph.
+
+## Querying the lake (DuckDB)
+
+The analytics layer is a `uv` project next to the Rust crate. It is
+strictly downstream: nothing in `cargo build` depends on it, and DuckDB
+simply reads the Parquet files the binary writes.
+
+```bash
+make gate2                       # validate every discovered source (~7 min)
+make gate5                       # Gate 5 of docs/corpus_readiness.md
+make gate5 LAKE=/tmp/some-lake   # ...against any other output root
+make sql SQL=sql/my_query.sql    # any file in sql/
+```
+
+`sql/gate5_reconciliation.sql` holds the reconciliation queries; each
+one returns a boolean `gate_5x_ok` column, and `scripts/run_sql.py`
+exits non-zero if any is false, so the gate can be scripted rather than
+eyeballed. `uv run` syncs `.venv` from `uv.lock` on demand — there is no
+install step, and the DuckDB Python package ships no CLI of its own.
+
+Note the DuckDB *shell* (`brew install duckdb`) is a separate thing
+from this project and also works; the queries are plain SQL either way.
 
 ## Safety notes for the full corpus
 

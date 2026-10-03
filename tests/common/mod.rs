@@ -279,3 +279,40 @@ pub fn misaligned_fixture(tmp: &Path) -> PathBuf {
     f.write_all(b"X").unwrap();
     path
 }
+
+/// Fixture whose final record is missing only its CRLF terminator.
+///
+/// Two whole records, then a third whose 54 content bytes are complete
+/// but which stops before the `\n`. Every field is intact, so the file
+/// is a `TrailingDefect::TerminatorOnly` — informational, not a data
+/// loss. This is the shape of the real corpus file
+/// `Year12/soup/soup_groc_1687_1739`, which stops one byte into its
+/// final terminator.
+pub fn terminator_only_fixture(tmp: &Path) -> PathBuf {
+    let path = tmp.join("Year1").join("beer").join("beer_drug_1114_1165");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let mut f = File::create(&path).unwrap();
+    f.write_all(HEADER_TEXT).unwrap();
+    f.write_all(b"\r\n").unwrap();
+    let row = RowBuilder::new()
+        .iri_key("1234567")
+        .week("1114")
+        .sy(" 0")
+        .ge(" 2")
+        .vend("18200")
+        .item("  647")
+        .units("    1")
+        .dollars("    9.29")
+        .feature("NONE")
+        .display("0")
+        .price_reduction("0")
+        .finish();
+    // Two complete rows.
+    f.write_all(&row).unwrap();
+    f.write_all(&row).unwrap();
+    // A third, complete in content but short of its CRLF: the last
+    // content byte is PR, then only `\r` — exactly one byte missing.
+    assert_eq!(row.len(), RECORD_LEN);
+    f.write_all(&row[..RECORD_LEN - 1]).unwrap();
+    path
+}

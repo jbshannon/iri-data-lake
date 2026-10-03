@@ -24,6 +24,14 @@
 /criterion/
 /benches/target/
 
+# Python: the analytics layer (sql/, scripts/run_sql.py) runs under uv.
+# uv writes .venv/.gitignore containing "*" itself, so the 44 MB
+# environment already self-ignores; don't delete that file.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
 # Editor
 .vscode/
 .idea/

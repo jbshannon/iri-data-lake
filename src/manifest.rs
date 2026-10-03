@@ -4,9 +4,11 @@
 //! versions and field names are kept identical so the on-disk data
 //! can be re-ingested cleanly.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::errors::IngestError;
 use crate::model::{ManifestRecord, ManifestStatus, CURRENT_SCHEMA_VERSION};
@@ -103,6 +105,112 @@ impl ManifestStore for JsonlManifest {
     }
 }
 
+/// Concurrency-safe manifest for multi-worker ingest (G1).
+///
+/// Two things the single-threaded [`JsonlManifest`] cannot do safely
+/// when several workers ingest files at once:
+///
+/// 1. **Append atomicity.** `JsonlManifest::append` opens and closes the
+///    file per record and issues a single `write_all` per line. That is
+///    *probably* atomic on APFS because of `O_APPEND`, but "probably" is
+///    not a property an idempotence store should have. Here one handle
+///    is opened once and every append is serialised behind a mutex.
+/// 2. **Lookup cost.** `last_for_path` re-reads and re-parses the whole
+///    file for every lookup, which is O(records²) per run. Here the
+///    manifest is read exactly once at open time into an in-memory index
+///    keyed by `source_path`; later lookups are a hash lookup under a
+///    short-lived lock.
+///
+/// The index is loaded *before* any worker starts, and every subsequent
+/// mutation goes through `append`, so the in-memory view is exactly what
+/// a re-read of the file would show — including records written by
+/// sibling workers earlier in this same run.
+pub struct SharedManifest {
+    state: Mutex<ManifestState>,
+}
+
+struct ManifestState {
+    /// Append-only handle opened once, `O_APPEND`.
+    file: File,
+    /// Where `file` lives, for error messages.
+    path: PathBuf,
+    /// `source_path` → most recent record. Updated on every append.
+    index: HashMap<PathBuf, ManifestRecord>,
+}
+
+impl std::fmt::Debug for SharedManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The `File` is not `Debug`-printable in a useful way and the
+        // index can be large; report shape only.
+        f.debug_struct("SharedManifest").finish_non_exhaustive()
+    }
+}
+
+impl SharedManifest {
+    /// Open (and read, once) the manifest under `output_root`.
+    pub fn open(output_root: &Path) -> Result<Self, IngestError> {
+        let path = manifest_path(output_root);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| IngestError::io(parent, e))?;
+        }
+        let bootstrap = JsonlManifest::open(output_root)?;
+        let mut index: HashMap<PathBuf, ManifestRecord> = HashMap::new();
+        for record in bootstrap.all()? {
+            index.insert(record.source_path.clone(), record);
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| IngestError::io(&path, e))?;
+        Ok(Self {
+            state: Mutex::new(ManifestState { file, path, index }),
+        })
+    }
+
+    /// The most recent record for `source_path`, or `None`.
+    ///
+    /// Clones the record because `skip_decision` needs an owned value
+    /// and the lock must not be held across a multi-millisecond
+    /// ingest.
+    pub fn last_for_path(&self, source_path: &Path) -> Result<Option<ManifestRecord>, IngestError> {
+        let state = self.state.lock().map_err(poisoned)?;
+        Ok(state.index.get(source_path).cloned())
+    }
+
+    /// The path of the JSONL file this handle appends to.
+    pub fn path(&self) -> PathBuf {
+        self.state
+            .lock()
+            .map(|s| s.path.clone())
+            .unwrap_or_else(|_| PathBuf::from("metadata/manifest.jsonl"))
+    }
+
+    /// Append `record` and make it visible to later `last_for_path` calls.
+    pub fn append(&self, record: &ManifestRecord) -> Result<(), IngestError> {
+        let line = serde_json::to_string(record)
+            .map_err(|e| IngestError::manifest(format!("serialise: {}", e)))?;
+        let mut state = self.state.lock().map_err(poisoned)?;
+        let path = state.path.clone();
+        // `write_all` on an O_APPEND handle emits one `write(2)` for the
+        // whole line in practice; the mutex makes that guarantee hold
+        // regardless of how the stream chunks it.
+        writeln!(state.file, "{}", line).map_err(|e| IngestError::io(&path, e))?;
+        state.file.flush().map_err(|e| IngestError::io(&path, e))?;
+        state
+            .index
+            .insert(record.source_path.clone(), record.clone());
+        Ok(())
+    }
+}
+
+/// A poisoned manifest lock means a previous append panicked mid-write.
+/// The file may have a torn last line, so treat it as a hard error
+/// rather than silently continuing on a corrupt idempotence store.
+fn poisoned<T>(_: std::sync::PoisonError<T>) -> IngestError {
+    IngestError::manifest("manifest lock poisoned by a panicking writer")
+}
+
 /// Decide whether `current` is skippable given a previously-recorded
 /// `prior` manifest entry.
 ///
@@ -195,6 +303,70 @@ mod tests {
         assert_eq!(last.source_path, r.source_path);
         let all = store.all().unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn shared_manifest_round_trips_under_concurrency() {
+        let dir = tempdir();
+        let store = SharedManifest::open(dir.path()).unwrap();
+        let records: Vec<ManifestRecord> = (0..64)
+            .map(|i| {
+                let mut r = dummy_record(
+                    &dir.path().join(format!("src-{i}")),
+                    ManifestStatus::Success,
+                );
+                r.run_id = format!("run-{i}");
+                r
+            })
+            .collect();
+
+        std::thread::scope(|s| {
+            for chunk in records.chunks(8) {
+                let store = &store;
+                s.spawn(move || {
+                    for r in chunk {
+                        store.append(r).unwrap();
+                    }
+                });
+            }
+        });
+
+        // Every record must be readable back, and the on-disk file must
+        // contain exactly 64 parseable lines (no torn interleaving).
+        for r in &records {
+            assert_eq!(
+                store.last_for_path(&r.source_path).unwrap().unwrap().run_id,
+                r.run_id
+            );
+        }
+        let on_disk = std::fs::read_to_string(manifest_path(dir.path())).unwrap();
+        let lines: Vec<&str> = on_disk.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(lines.len(), records.len());
+        for line in lines {
+            JsonlManifest::parse_line(line)
+                .unwrap()
+                .expect("no torn line");
+        }
+    }
+
+    #[test]
+    fn shared_manifest_sees_earlier_appends_as_prior_records() {
+        let dir = tempdir();
+        let store = SharedManifest::open(dir.path()).unwrap();
+        let r = dummy_record(&dir.path().join("src"), ManifestStatus::Success);
+        store.append(&r).unwrap();
+        let prior = store.last_for_path(&r.source_path).unwrap();
+        assert!(skip_decision(&r, prior.as_ref()).unwrap().is_some());
+        // A second, independently-opened store must agree.
+        let reopened = SharedManifest::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .last_for_path(&r.source_path)
+                .unwrap()
+                .unwrap()
+                .run_id,
+            r.run_id
+        );
     }
 
     #[test]
