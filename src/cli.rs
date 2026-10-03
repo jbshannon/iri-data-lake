@@ -174,6 +174,17 @@ fn parse_shard(s: &str) -> Result<(usize, usize), String> {
 pub enum OutputFormat {
     Table,
     Json,
+    /// One discovered source path per line, sorted, on stdout.
+    ///
+    /// Exists so that discovery's *decisions* can be consumed by other
+    /// tools rather than re-derived from scratch: the Gate 2
+    /// validation sweep pipes this straight into `xargs`, and it is the
+    /// only supported way to enumerate what `ingest-all` would touch.
+    /// Anything that greps filenames itself will drift from
+    /// `discovery.rs` — the skips are 2 733 files across six reasons,
+    /// and PANEL/stub/backup files are not reliably filterable from the
+    /// shell.
+    Paths,
 }
 
 /// Scheduling order for `ingest-all`'s work list.

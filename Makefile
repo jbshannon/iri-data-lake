@@ -39,6 +39,7 @@ help:
 	@echo "  make clean          cargo clean + remove criterion/ and target/"
 	@echo "  make clean-tmp      Delete stale *.tmp leftovers under $(OUT) (older than $(TMP_MAX_AGE_HOURS)h)"
 	@echo "  make readiness      Gated plan for the full 143 GB corpus run"
+	@echo "  make gate2          Validate every discovered source before ingesting"
 	@echo "  make gate5          Reconcile $(LAKE) against its manifest (DuckDB)"
 	@echo "  make sql SQL=...    Run an arbitrary file from sql/ against $(LAKE)"
 
@@ -69,6 +70,12 @@ build:
 .PHONY: inventory
 inventory:
 	$(BIN) run --release -- inventory --input $(IN)
+
+# Gate 2: validate every discovered source (header + every record's
+# alignment). Writes nothing. Exits non-zero on any failure.
+.PHONY: gate2
+gate2:
+	./scripts/gate2_validate.sh
 
 .PHONY: validate
 validate:

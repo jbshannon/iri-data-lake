@@ -59,6 +59,7 @@ fn run(cli: Cli) -> Result<()> {
             match format {
                 OutputFormat::Table => print_inventory_table(&inv),
                 OutputFormat::Json => print_inventory_json(&inv),
+                OutputFormat::Paths => print_inventory_paths(&inv),
             }
             Ok(())
         }
@@ -412,6 +413,23 @@ fn print_inventory_json(inv: &discovery::Inventory) {
         "skipped_count": inv.skipped.len(),
     });
     println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+/// One discovered source path per line, sorted.
+///
+/// The point is that this list comes from `discovery.rs`, not from a
+/// shell re-implementation of its filter. Gate 2 pipes it into
+/// `xargs -P` to validate every file; see `scripts/gate2_validate.sh`.
+fn print_inventory_paths(inv: &discovery::Inventory) {
+    let mut paths: Vec<&std::path::Path> = inv
+        .files
+        .iter()
+        .map(|f| f.identity.path.as_path())
+        .collect();
+    paths.sort_unstable();
+    for p in paths {
+        println!("{}", p.display());
+    }
 }
 
 fn print_validation(r: &iri_lake::validation::ValidationReport) {
