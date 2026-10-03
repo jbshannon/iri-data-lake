@@ -220,6 +220,42 @@ cargo run --release -- ingest-all --input data/raw --output-root $OUT --year 1
 cargo run --release -- ingest-all --input data/raw --output-root $OUT --dry-run
 ```
 
+### Result (2026-10-03, into `data/lake`)
+
+| step | scope | files | result |
+|---|---|---:|---|
+| 3a | one file, twice | 1 | ingested 660 096 rows; second run **SKIP**; 1 Parquet file, 0 `.tmp` |
+| 3b | `--category beer` (all 12 years) | 24 | 23 completed, 1 skipped (3a's file), **0 failed**, 10.8 s |
+| 3c | `--year 1` | 62 | 60 completed, 2 skipped (3a's), **0 failed**, 16.1 s |
+| 3d | whole corpus, `--dry-run` | 744 | 744 selected (140.85 GiB, ~2.689 B rows); manifest and Parquet counts unchanged — 84 records, 365 files |
+
+Every step produced a clean manifest: **84 records, all `success`, zero
+`failed`, zero `in_progress`, zero stray `.tmp`**.
+
+Skipping was exercised rather than assumed — 3a's file was skipped
+twice, once per later scope — and the dry run confirmed it writes
+nothing by leaving both the manifest (84 records) and the file count
+(365) untouched.
+
+An early sanity pass over what the ramp wrote, before committing to the
+full run:
+
+```
+year=1 coverage      31 categories, 2 channels, 193,396,668 rows, weeks 1114-1165
+beer, all years      12 years, 132,919,108 rows, $6,900,619,153.41
+sentinels            zero_iri_key 0, negative_dollars 0, feature_code>4 0
+manifest vs disk     317,129,053 = 317,129,053, rejected_rows 0
+```
+
+The manifest/disk agreement is the check that matters here: 317 129 053
+rows claimed, 317 129 053 rows on disk, across two overlapping scopes
+ingested by three separate invocations.
+
+**Do not wipe `data/lake` before Gate 4.** The ramp's 84 files are
+legitimate output recorded in the manifest, and Gate 4's
+`ingest-all` will skip them and ingest the remaining 660. That is the
+resume path working, not wasted work.
+
 Note that 3b and 3c pass **no `--resume`**, and none is needed: skip-if-present
 is the resolved default when neither `--resume` nor `--overwrite` is given.
 Pass `--overwrite` only when you intend to discard and rewrite completed
@@ -355,7 +391,10 @@ correction above.
       `Year12/soup/soup_groc_1687_1739`, passes with a warning because
       it is missing only a line terminator, not any field (decision 6 in
       §7); its re-pull from the raw archive is follow-up item 7
-- [ ] Gate 3 ramp, each scope with a clean manifest
+- [x] Gate 3 ramp — **run 2026-10-03**: 3a/3b/3c/3d all clean, 84
+      records all `success`, 0 failed, 0 `.tmp`; manifest rows equal
+      disk rows (317,129,053). The ramp's output is intentionally left
+      in place for Gate 4 to resume from.
 - [ ] Gate 4 full run complete, log archived (dry-measured end to end at
       ~270 s into a scratch root; the production `data/lake` run is still
       to be issued)
