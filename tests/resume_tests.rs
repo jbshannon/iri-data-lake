@@ -173,6 +173,58 @@ fn overwrite_mode_re_ingests_even_when_manifest_matches() {
         IngestOutcome::Completed(_, s) => assert_eq!(s.written_rows, 64),
         other => panic!("expected Completed under Overwrite, got {:?}", other),
     }
+
+    // The row count above is necessary but not sufficient: a rewrite that
+    // leaves the prior run's files on disk still reports the right number of
+    // rows written, and only shows up as a doubled lake. `plan_output_paths`
+    // embeds the new run id in every filename, so nothing collides by
+    // accident and the superseded set must be reaped explicitly.
+    let parquets = lake_files(&lake);
+    assert_eq!(
+        parquets.len(),
+        1,
+        "overwrite must leave exactly one Parquet file, found {parquets:?}"
+    );
+
+    // And the manifest must not accumulate a second record per source, or
+    // Gate 5's 5a ("one record per source, no duplicates") fails.
+    let records = manifest_lines(&lake);
+    assert_eq!(
+        records.len(),
+        2,
+        "two runs means two append-only records; 5a reads the latest per \
+         source, so this is only a guard on gross duplication: {records:?}"
+    );
+}
+
+/// Every `*.parquet` file under `lake`, sorted for stable assertion output.
+fn lake_files(lake: &std::path::Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![lake.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "parquet") {
+                out.push(p.display().to_string());
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Raw `manifest.jsonl` lines.
+fn manifest_lines(lake: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(lake.join("metadata").join("manifest.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 #[test]

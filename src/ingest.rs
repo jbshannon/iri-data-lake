@@ -244,6 +244,11 @@ pub fn ingest_file_with(
     let started_at = Utc::now();
     let timer = Timer::start();
 
+    // Outputs belonging to a prior run of *this* source that an
+    // `--overwrite` is superseding. Populated only in the Overwrite arm
+    // below, and deleted only once the replacement is durably written.
+    let mut prior_outputs_to_remove: Vec<PathBuf> = Vec::new();
+
     // Compose the prospective ManifestRecord so skip_decision() can match.
     let prospective = ManifestRecord {
         run_id: run_id.clone(),
@@ -280,13 +285,16 @@ pub fn ingest_file_with(
             OverwriteMode::SkipIfPresent => return Ok(IngestOutcome::Skipped(prior_ok)),
             OverwriteMode::Overwrite => {
                 // Explicitly asked to rewrite: fall through and re-ingest.
-                // The Parquet writer renames over the existing file, so
-                // the output is replaced in place.
                 tracing::info!(
                     source = %path.display(),
                     prior_run = %prior_ok.run_id,
                     "overwriting prior output (--overwrite)"
                 );
+                // `plan_output_paths` embeds *this* run's short id in every
+                // output filename, so the new files cannot collide with the
+                // prior run's and nothing is "replaced in place". Stash the
+                // prior set so it can be reaped once the new one lands.
+                prior_outputs_to_remove = prior_ok.output_paths.clone();
             }
             OverwriteMode::Refuse => {
                 return Err(IngestError::OutputsExist {
@@ -415,6 +423,32 @@ pub fn ingest_file_with(
         error_message: None,
     };
     store.append(&final_record)?;
+
+    // Reap the superseded output set, and only now: the replacement is
+    // written and recorded, so an interrupted run leaves the old output
+    // in place rather than leaving the source with neither. Best-effort,
+    // like the `.tmp` sweep -- these are inert files, and a failure to
+    // remove one must not fail a successful ingest. It does, however,
+    // silently double that source's footprint, so it is logged.
+    for old in prior_outputs_to_remove {
+        // Defensive: never delete a path this run just wrote.
+        if final_record.output_paths.contains(&old) {
+            continue;
+        }
+        match std::fs::remove_file(&old) {
+            Ok(()) => tracing::debug!(
+                path = %old.display(),
+                "removed output superseded by --overwrite"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                path = %old.display(),
+                error = %e,
+                "failed to remove output superseded by --overwrite; \
+                 it stays in the lake and will double this source's row count"
+            ),
+        }
+    }
 
     Ok(IngestOutcome::Completed(final_record, stats))
 }
