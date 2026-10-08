@@ -34,7 +34,7 @@ use crate::fixed_width::{self, TrailingDefect, HEADER_LEN, RECORD_LEN};
 use crate::manifest::{skip_decision, SharedManifest};
 use crate::metrics::{sha256_of_file, Timer};
 use crate::model::{
-    bronze_root, Channel, IngestStats, ManifestRecord, ManifestStatus, SourceIdentity,
+    bronze_root, Channel, DatasetKind, IngestStats, ManifestRecord, ManifestStatus, SourceIdentity,
     CURRENT_SCHEMA_VERSION, PARSER_VERSION,
 };
 use crate::parquet_output::write_parquet_atomic;
@@ -252,14 +252,17 @@ pub fn ingest_file_with(
     // Compose the prospective ManifestRecord so skip_decision() can match.
     let prospective = ManifestRecord {
         run_id: run_id.clone(),
+        dataset: DatasetKind::Sales,
         source_path: path.to_path_buf(),
         source_size_bytes: size,
         source_sha256: source_sha256.clone(),
-        source_year: identity.year,
-        category: identity.category.clone(),
-        channel: identity.channel,
-        filename_week_start: identity.filename_week_start,
-        filename_week_end: identity.filename_week_end,
+        source_year: Some(identity.year),
+        category: Some(identity.category.clone()),
+        channel: Some(identity.channel),
+        filename_week_start: Some(identity.filename_week_start),
+        filename_week_end: Some(identity.filename_week_end),
+        deduplicated_from: None,
+        source_schema_fingerprint: None,
         expected_rows,
         written_rows: 0, // placeholder
         rejected_rows,
@@ -398,14 +401,17 @@ pub fn ingest_file_with(
 
     let final_record = ManifestRecord {
         run_id: run_id.clone(),
+        dataset: DatasetKind::Sales,
         source_path: path.to_path_buf(),
         source_size_bytes: size,
         source_sha256,
-        source_year: identity.year,
-        category: identity.category.clone(),
-        channel: identity.channel,
-        filename_week_start: identity.filename_week_start,
-        filename_week_end: identity.filename_week_end,
+        source_year: Some(identity.year),
+        category: Some(identity.category.clone()),
+        channel: Some(identity.channel),
+        filename_week_start: Some(identity.filename_week_start),
+        filename_week_end: Some(identity.filename_week_end),
+        deduplicated_from: None,
+        source_schema_fingerprint: None,
         expected_rows,
         written_rows,
         rejected_rows,
@@ -608,14 +614,17 @@ fn failure_record(
 ) -> ManifestRecord {
     ManifestRecord {
         run_id: uuid::Uuid::new_v4().to_string(),
+        dataset: DatasetKind::Sales,
         source_path: f.identity.path.clone(),
         source_size_bytes: f.size_bytes,
         source_sha256: String::new(),
-        source_year: f.identity.year,
-        category: f.identity.category.clone(),
-        channel: f.identity.channel,
-        filename_week_start: f.identity.filename_week_start,
-        filename_week_end: f.identity.filename_week_end,
+        source_year: Some(f.identity.year),
+        category: Some(f.identity.category.clone()),
+        channel: Some(f.identity.channel),
+        filename_week_start: Some(f.identity.filename_week_start),
+        filename_week_end: Some(f.identity.filename_week_end),
+        deduplicated_from: None,
+        source_schema_fingerprint: None,
         expected_rows: fixed_width::expected_rows(f.size_bytes).unwrap_or(0),
         written_rows: 0,
         rejected_rows: 0,

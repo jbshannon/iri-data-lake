@@ -56,6 +56,8 @@ arrow = { version = "53", default-features = false, features = ["prettyprint"] }
 arrow-array = "53"
 arrow-schema = "53"
 parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+calamine = { version = "0.30", default-features = false, features = ["dates"] }
+csv = "1"
 
 [dev-dependencies]
 approx = "0.5"

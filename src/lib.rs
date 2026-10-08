@@ -18,6 +18,8 @@ pub mod arrow_output;
 pub mod cleanup;
 pub mod cli;
 pub mod config;
+pub mod dataset;
+pub mod datasets;
 pub mod discovery;
 pub mod errors;
 pub mod feature;

@@ -295,26 +295,103 @@ pointer arithmetic, no `from_utf8_unchecked`. We use
 return typed `Result`s and let us surface malformed input as a
 structured `IngestError`.
 
+## Dataset classes
+
+`iri_sales` is **not** the only class. The corpus holds ten more, and
+they are ingested by a generic driver (`src/datasets/`) that shares the
+manifest, the skip decision, the atomic Parquet write and the
+failure-is-a-value policy, but not the per-file pipeline.
+
+```
+                    ┌──────────────────────────────────────┐
+                    │ ingest-all (umbrella, sequential)    │
+                    └──────────────┬───────────────────────┘
+             ┌─────────────────────┼──────────────────────────┐
+             ▼                     ▼                          ▼
+   ┌──────────────────┐  ┌────────────────────┐  ┌──────────────────────┐
+   │ ingest-sales     │  │ src/datasets/      │  │ src/datasets/        │
+   │ (dedicated,      │  │ ingest.rs          │  │ umbrella.rs          │
+   │  143 GB, gated)  │  │ sha → skip → parse │  │ one class at a time  │
+   └──────────────────┘  │ → Parquet → manifest│ └──────────────────────┘
+                         └─────────┬──────────┘
+                                   │ DatasetParser
+        ┌──────────┬──────────┬────┴─────┬──────────┬───────────┐
+        ▼          ▼          ▼          ▼          ▼           ▼
+      panel   delivery  product_attr  csv.rs   excel.rs   delimited.rs
+                     _stores
+```
+
+| class | bronze table | partition keys |
+|---|---|---|
+| `Panel` | `iri_panel` | `year`, `category`, `outlet` |
+| `ProductAttr` | `iri_product_attr` | `year`, `category` |
+| `PanelistDemos` | `iri_panelist_demos` | `year` |
+| `DeliveryStores` | `iri_delivery_stores` | `year` |
+| `PanelTrips` | `iri_panel_trips` | `year` |
+| `ProductStub` | `iri_product_stub` | `edition` |
+| `PanelStatic`, `AdsDemos`, `WeekDimension`, `ChainXref`, `ManualStoreEntry` | — | none |
+
+Partition keys are **declared per class**, not inferred from whatever
+the identity happens to carry. `iri_delivery_stores` carries a category
+(the directory it was found in) and must not partition by it: the 31
+categories of a year share one 2 053-row roster, so partitioning by
+category would make every join a 31-way union.
+
+The corpus survey that produced all of this — including the four PANEL
+dialects, the 21-byte `prod_attr` pitch, the 63-byte store roster, and
+the places where the on-disk data contradicts `docs/data_layout.md` —
+is in [`docs/other_sources.md`](docs/other_sources.md).
+
+### Two kinds of schema
+
+**Fixed** (panel, rosters, trips, static, the week dimension, the small
+cross-references): one Arrow schema per class, declared in code beside
+its offset constants. All four PANEL dialects normalise onto one
+8-column schema with `minute` **nullable**, because the pre-year-8
+dialects genuinely lack the column — and `minute = 0` would be
+*wrong*, not merely imprecise, since it is indistinguishable from a real
+midnight trip.
+
+**Per-file** (stubs, `prod_attr`, the demographics): the column set is
+a property of the file. Each writes one Parquet file with the schema
+its own header declares, and the manifest records a digest of the
+column names in `source_schema_fingerprint`. Forcing them onto one
+schema means inventing 69 all-null columns for `toitisu` or dropping
+attributes for `saltsnck`.
+
+The two are separate manifest fields because they answer different
+questions and are checked at different times. `output_schema_version`
+is a constant per class — "has the code changed?" — compared *before*
+the source is parsed, which is what makes resume cheap.
+`source_schema_fingerprint` is "did this file's columns change?", only
+knowable after reading the header. Conflating them makes every
+per-file-schema class unskippable.
+
 ## Planned extensions
 
-1. **PANEL parsing as a separate pipeline.** Years 1–2 are
-   tab-delimited, years 3–7 are whitespace-delimited, years 8–12
-   are comma-delimited with an extra `MINUTE` column. Year 8 adds
-   `PANEL_KK`. The header line is the dispatcher.
-2. **Deduplicated `Delivery_Stores`.** Hash the file once, write a
-   canonical copy under `data/lake/bronze/delivery_stores/year=<N>/`
-   with a symlink or reference back to the canonical from each
-   category directory.
-3. **Deduplicated `DEMOS.CSV`.** Same pattern — one copy per year.
-4. **Product-stub ingestion.** `.xls` (BIFF) for years 1–6,
-   `.xlsx` (OOXML) for years 7–12. Two Rust crates needed (or a
-   single `.xls`→`.xlsx` pre-pass).
+1. ~~**PANEL parsing as a separate pipeline.**~~ **Done** — and it is
+   *four* dialects, not three: `Year11/diapers/
+   diapers_PANEL_GK_1635_1686.DAT` is tab-delimited with the year-8+
+   `MINUTE` column. The delimiter and the MINUTE presence are therefore
+   two independent facts, both read from the header. See
+   `docs/other_sources.md` § 2.1.
+2. **Deduplicated `Delivery_Stores`.** 372 files hold ~62 distinct
+   byte sequences. `ManifestRecord.deduplicated_from` exists for this
+   and is not yet written; see `docs/other_sources.md` § 6.
+3. **Deduplicated `DEMOS.CSV`.** 217 files hold 7. Same pattern.
+4. ~~**Product-stub ingestion.**~~ **Done** — one crate, [`calamine`],
+   reads both BIFF and OOXML. Sheet selection is by content, not
+   position: the year-7 workbook has three sheets and only `Sheet1` is
+   the stub.
 5. **Delta Lake / Apache Iceberg table metadata.** Once the
    partition directory is in place, the upgrade path is to wrap it
    in an Iceberg `Table` and let DuckDB / Spark treat it as a real
    table rather than a directory of files.
 6. **DuckDB / dbt analytical layer.** Materialised views on top of
-   the Bronze Parquet for the silver / gold layers.
+   the Bronze Parquet for the silver / gold layers. Gate 6
+   (`sql/gate6_non_sales.sql`) is the first of these: nine
+   reconciliation checks over the non-sales tables and their joins to
+   sales.
 7. **Object-store support.** `object_store` crate behind a `Source`
    trait so a future run can read from S3 / GCS / R2 directly,
    without changing the parser.
