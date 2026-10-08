@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::config::{IngestConfig, OverwriteMode, UnknownFeaturePolicy};
 use crate::discovery;
+use crate::model::DatasetKind;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -84,8 +85,18 @@ pub enum Cmd {
         #[arg(long)]
         resume: bool,
     },
-    /// Discover and ingest every eligible sales file.
-    IngestAll {
+    /// Discover and ingest every eligible **sales** file.
+    ///
+    /// This is the original pipeline, unchanged: 744 files, 143 GB,
+    /// the fixed-width sales parser, the measured parallelism. See
+    /// `docs/parallelism.md` and `docs/corpus_readiness.md`.
+    ///
+    /// It is separate from [`Cmd::IngestAll`] because it is the one
+    /// pipeline with a measured performance contract and five
+    /// documented gates behind it, and folding eleven small datasets
+    /// into it would put those measurements at the mercy of unrelated
+    /// work.
+    IngestSales {
         /// Input root override.
         #[arg(long)]
         input: Option<PathBuf>,
@@ -129,6 +140,55 @@ pub enum Cmd {
         /// one output root — see `docs/parallelism.md`.
         #[arg(long, value_parser = parse_shard)]
         shard: Option<(usize, usize)>,
+    },
+    /// Ingest every dataset class: sales plus all ten non-sales ones.
+    ///
+    /// Classes run **sequentially**, each with its own discovery,
+    /// parallelism and batch sizing, and each is resumable at dataset
+    /// grain. Sales runs first, through the dedicated pipeline.
+    ///
+    /// `--only` / `--skip` restrict which classes run. `--dry-run`
+    /// discovers and reports without writing anything.
+    IngestAll {
+        /// Input root override.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Output root override.
+        #[arg(long)]
+        output_root: Option<PathBuf>,
+        /// Only run these dataset classes. Repeatable. Omit for all.
+        #[arg(long = "only", value_name = "CLASS")]
+        only: Vec<String>,
+        /// Skip these dataset classes. Repeatable.
+        #[arg(long = "skip", value_name = "CLASS")]
+        skip: Vec<String>,
+        /// Overwrite any existing Parquet outputs.
+        #[arg(long)]
+        overwrite: bool,
+        /// Discover and report, but write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Include the sales class (default: yes, use --skip sales).
+        #[arg(long)]
+        no_sales: bool,
+        /// Worker threads within each class.
+        #[arg(long)]
+        workers: Option<usize>,
+        /// Show each class's skip reasons, not just counts.
+        #[arg(long)]
+        explain_skips: bool,
+    },
+    /// Walk the input tree and report the non-sales datasets.
+    InventoryOther {
+        /// Override the input root.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = OtherInventoryFormat::Table)]
+        format: OtherInventoryFormat,
+        /// Show each class's skip reasons, not just counts.
+        #[arg(long)]
+        explain_skips: bool,
     },
     /// Run parser / Arrow / Parquet micro-benchmarks on one file.
     Benchmark {
@@ -259,6 +319,68 @@ fn stripe(files: &mut Vec<discovery::DiscoveredFile>, n: usize) {
     }
     // Compact away the `None` holes produced by ragged strides.
     *files = out.into_iter().flatten().collect();
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OtherInventoryFormat {
+    /// One line per class: files, bytes, and a skip count.
+    Table,
+    Json,
+    /// One discovered source path per line, sorted.
+    ///
+    /// The same contract as [`OutputFormat::Paths`]: the work list
+    /// comes from `dataset::discover`, so a caller cannot drift from
+    /// the filters the ingest path actually applies.
+    Paths,
+}
+
+/// Resolve `--only` / `--skip` into an ordered class list.
+///
+/// Errors name the offending token and list what is valid, because
+/// `--only panle` is a typo and an error that just says "unknown
+/// dataset" sends the reader hunting through the source.
+pub fn resolve_classes(
+    only: &[String],
+    skip: &[String],
+    include_sales: bool,
+) -> std::result::Result<Vec<DatasetKind>, String> {
+    let all: Vec<DatasetKind> = if include_sales {
+        let mut v = vec![DatasetKind::Sales];
+        v.extend_from_slice(DatasetKind::others());
+        v
+    } else {
+        DatasetKind::others().to_vec()
+    };
+    let known: Vec<String> = all.iter().map(|k| k.to_string()).collect();
+
+    if !only.is_empty() {
+        let mut picked = Vec::new();
+        for token in only {
+            let k = DatasetKind::parse(token)
+                .ok_or_else(|| format!("unknown dataset {token:?}; known: {}", known.join(", ")))?;
+            if !all.contains(&k) {
+                return Err(format!(
+                    "dataset {k} is not available here; known: {}",
+                    known.join(", ")
+                ));
+            }
+            if !picked.contains(&k) {
+                picked.push(k);
+            }
+        }
+        // Preserve the canonical order rather than the CLI's order, so
+        // `--only stub,panel` and `--only panel,stub` do the same work
+        // in the same sequence.
+        return Ok(all.into_iter().filter(|k| picked.contains(k)).collect());
+    }
+
+    let mut out = all;
+    for token in skip {
+        let k = DatasetKind::parse(token)
+            .ok_or_else(|| format!("unknown dataset {token:?}; known: {}", known.join(", ")))?;
+        out.retain(|x| *x != k);
+    }
+    Ok(out)
 }
 
 impl Cli {

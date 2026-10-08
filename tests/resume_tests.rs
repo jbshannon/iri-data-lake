@@ -12,20 +12,23 @@ use iri_lake::errors::IngestError;
 use iri_lake::ingest::{ingest_file, IngestFilter, IngestOutcome};
 use iri_lake::manifest::{skip_decision, JsonlManifest, ManifestStore};
 use iri_lake::model::{
-    Channel, ManifestRecord, ManifestStatus, CURRENT_SCHEMA_VERSION, PARSER_VERSION,
+    Channel, DatasetKind, ManifestRecord, ManifestStatus, CURRENT_SCHEMA_VERSION, PARSER_VERSION,
 };
 
 fn fresh_record(path: &Path) -> ManifestRecord {
     ManifestRecord {
         run_id: "test".into(),
+        dataset: DatasetKind::Sales,
         source_path: path.to_path_buf(),
         source_size_bytes: 100,
         source_sha256: "abc".into(),
-        source_year: 1,
-        category: "beer".into(),
-        channel: Channel::Drug,
-        filename_week_start: 1,
-        filename_week_end: 52,
+        source_year: Some(1),
+        category: Some("beer".into()),
+        channel: Some(Channel::Drug),
+        filename_week_start: Some(1),
+        filename_week_end: Some(52),
+        deduplicated_from: None,
+        source_schema_fingerprint: None,
         expected_rows: 10,
         written_rows: 10,
         rejected_rows: 0,

@@ -20,6 +20,12 @@ SWEEP_FILE ?= $(FIXTURE_INPUT)
 # (--tmp-max-age-hours); the age gate protects a concurrent run.
 TMP_MAX_AGE_HOURS ?= 24
 
+# Extra flags forwarded to the sales / umbrella / other-dataset targets.
+#   make ingest-all   SALES_FLAGS="--year 1 --workers 8 --shard 0/4"
+#   make ingest-other OTHER_FLAGS="--only panel --explain-skips"
+SALES_FLAGS ?=
+OTHER_FLAGS ?=
+
 # ---- Targets ---------------------------------------------------------------
 
 .PHONY: help
@@ -33,14 +39,18 @@ help:
 	@echo "  make sweep          Sweep compression codecs on $(FIXTURE_INPUT)"
 	@echo "  make build          Release build of the CLI"
 	@echo "  make inventory      Walk $(IN) and print sales-file inventory"
-	@echo "  make validate       Validate a single file ($(FIXTURE_INPUT))"
-	@echo "  make ingest         Ingest a single file into $(FIXTURE_OUTPUT)"
-	@echo "  make ingest-all     Walk $(IN) and ingest every eligible sales file"
+	@echo "  make inventory-other  Walk $(IN) and print the non-sales datasets"
+	@echo "  make validate       Validate a single sales file ($(FIXTURE_INPUT))"
+	@echo "  make ingest         Ingest a single sales file into $(FIXTURE_OUTPUT)"
+	@echo "  make ingest-sales   Walk $(IN) and ingest every eligible sales file"
+	@echo "  make ingest-all     Umbrella: ingest-sales, then every non-sales dataset"
+	@echo "  make ingest-other   Umbrella over the non-sales datasets only (no sales)"
 	@echo "  make clean          cargo clean + remove criterion/ and target/"
 	@echo "  make clean-tmp      Delete stale *.tmp leftovers under $(OUT) (older than $(TMP_MAX_AGE_HOURS)h)"
 	@echo "  make readiness      Gated plan for the full 143 GB corpus run"
-	@echo "  make gate2          Validate every discovered source before ingesting"
+	@echo "  make gate2          Validate every discovered sales source before ingesting"
 	@echo "  make gate5          Reconcile $(LAKE) against its manifest (DuckDB)"
+	@echo "  make gate6          Reconcile the non-sales tables + cross-table joins (DuckDB)"
 	@echo "  make sql SQL=...    Run an arbitrary file from sql/ against $(LAKE)"
 
 .PHONY: fmt
@@ -71,8 +81,14 @@ build:
 inventory:
 	$(BIN) run --release -- inventory --input $(IN)
 
-# Gate 2: validate every discovered source (header + every record's
-# alignment). Writes nothing. Exits non-zero on any failure.
+# The non-sales datasets: panel, trips, attributes, stubs, rosters and
+# the small dimension tables. Report only; writes nothing.
+.PHONY: inventory-other
+inventory-other:
+	$(BIN) run --release -- inventory-other --input $(IN) $(OTHER_FLAGS)
+
+# Gate 2: validate every discovered sales source (header + every
+# record's alignment). Writes nothing. Exits non-zero on any failure.
 .PHONY: gate2
 gate2:
 	./scripts/gate2_validate.sh
@@ -85,9 +101,26 @@ validate:
 ingest:
 	$(BIN) run --release -- ingest $(FIXTURE_INPUT) --output-root $(OUT)
 
+# The sales pipeline. This is the former `ingest-all`, renamed and
+# otherwise unchanged: 744 files, 143 GB, the measured parallelism
+# from docs/parallelism.md and the gates in docs/corpus_readiness.md.
+.PHONY: ingest-sales
+ingest-sales:
+	$(BIN) run --release -- ingest-sales --input $(IN) --output-root $(OUT) $(SALES_FLAGS)
+
+# The umbrella. Sales first (largest and slowest, so an interrupted
+# run has still done the expensive part), then the ten non-sales
+# datasets sequentially. Restrict it with OTHER_FLAGS, e.g.
+#   make ingest-all OTHER_FLAGS="--only panel --explain-skips"
 .PHONY: ingest-all
 ingest-all:
-	$(BIN) run --release -- ingest-all --input $(IN) --output-root $(OUT)
+	$(BIN) run --release -- ingest-all --input $(IN) --output-root $(OUT) $(OTHER_FLAGS)
+
+# Same umbrella, sales excluded. The target to iterate on while the new
+# parsers are still moving: it is ~2.3 GB against sales' 143 GB.
+.PHONY: ingest-other
+ingest-other:
+	$(BIN) run --release -- ingest-all --input $(IN) --output-root $(OUT) --no-sales $(OTHER_FLAGS)
 
 .PHONY: clean
 clean:
@@ -117,6 +150,13 @@ sql:
 .PHONY: gate5
 gate5:
 	uv run python scripts/run_sql.py sql/gate5_reconciliation.sql --lake $(LAKE)
+
+# Gate 6: reconcile the ten non-sales tables against the manifest and
+# against each other. Needs a lake that has had `make ingest-other` run
+# against it; gate 6.2 and 6.4 additionally need `iri_sales` present.
+.PHONY: gate6
+gate6:
+	uv run python scripts/run_sql.py sql/gate6_non_sales.sql --lake $(LAKE)
 
 # ---- Full-corpus run -------------------------------------------------------
 

@@ -11,11 +11,13 @@ use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use iri_lake::cleanup::{cleanup_stale_tmp, CleanupReport};
-use iri_lake::cli::{Cli, Cmd, OutputFormat};
+use iri_lake::cli::{Cli, Cmd, OtherInventoryFormat, OutputFormat};
+use iri_lake::dataset;
+use iri_lake::datasets::umbrella::{self, ClassResult};
 use iri_lake::discovery;
 use iri_lake::errors::IngestError;
 use iri_lake::ingest::{ingest_all, ingest_file, IngestAllSummary, IngestFilter, IngestOutcome};
-use iri_lake::model::Channel;
+use iri_lake::model::{Channel, DatasetKind};
 use iri_lake::validation::validate_file;
 
 fn main() -> ExitCode {
@@ -46,8 +48,9 @@ fn run(cli: Cli) -> Result<()> {
     // Resolve the skip/overwrite policy once, up front, so that a
     // contradictory pair of flags fails before any work starts.
     let resume = matches!(&cli.cmd, Cmd::Ingest { resume, .. } if *resume)
-        || matches!(&cli.cmd, Cmd::IngestAll { resume, .. } if *resume);
-    let overwrite = matches!(&cli.cmd, Cmd::IngestAll { overwrite, .. } if *overwrite);
+        || matches!(&cli.cmd, Cmd::IngestSales { resume, .. } if *resume);
+    let overwrite = matches!(&cli.cmd, Cmd::IngestSales { overwrite, .. } if *overwrite)
+        || matches!(&cli.cmd, Cmd::IngestAll { overwrite, .. } if *overwrite);
     config.overwrite = cli
         .overwrite_mode(resume, overwrite)
         .map_err(IngestError::Config)
@@ -128,7 +131,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::IngestAll {
+        Cmd::IngestSales {
             input,
             output_root,
             resume: _,
@@ -141,140 +144,59 @@ fn run(cli: Cli) -> Result<()> {
             workers,
             order,
             shard,
+        } => run_ingest_sales(
+            config,
+            input,
+            output_root,
+            overwrite,
+            dry_run,
+            max_files,
+            year,
+            category,
+            channel,
+            workers,
+            order,
+            shard,
+        ),
+        Cmd::IngestAll {
+            input,
+            output_root,
+            only,
+            skip,
+            overwrite: _,
+            dry_run,
+            no_sales,
+            workers,
+            explain_skips,
         } => {
             let in_root = input.unwrap_or_else(|| config.input_root.clone());
             let out_root = output_root.unwrap_or_else(|| config.output_root.clone());
-            let channel_filter: Option<Channel> = channel.as_deref().and_then(Channel::parse);
-
-            let inv = discovery::discover(&in_root).context("ingest-all discovery")?;
-            // Largest-first ordering for tail-latency smoothing.
-            let mut files: Vec<_> = inv
-                .files
-                .iter()
-                .filter(|f| match year {
-                    Some(y) => f.identity.year == y,
-                    None => true,
-                })
-                .filter(|f| match &category {
-                    Some(c) => &f.identity.category == c,
-                    None => true,
-                })
-                .filter(|f| match channel_filter {
-                    Some(c) => f.identity.channel == c,
-                    None => true,
-                })
-                .cloned()
-                .collect();
-            files.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
-            if let Some(n) = max_files {
-                files.truncate(n);
+            let classes = iri_lake::cli::resolve_classes(&only, &skip, !no_sales)
+                .map_err(anyhow::Error::msg)?;
+            if classes.is_empty() {
+                anyhow::bail!("--only/--skip selected no dataset classes");
             }
-            let workers = workers.or(config.worker_threads).unwrap_or(1).max(1);
-            order.apply(&mut files, workers);
-            if let Some((idx, n)) = shard {
-                files = take_shard(files, idx, n);
-            }
-
-            // Report the *selected* bytes/rows, not the whole
-            // inventory's: with `--shard`, `--year` or `--max-files`
-            // the two differ by an order of magnitude and the old
-            // line made a 4-file shard look like the full corpus.
-            let sel_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
-            let sel_rows: u64 = files
-                .iter()
-                .map(|f| iri_lake::fixed_width::expected_rows(f.size_bytes).unwrap_or(0))
-                .sum();
-            println!(
-                "ingest-all: {} file(s) selected ({:.2} GiB raw, ~{:.3}B rows) of {} discovered ({:.2} GiB); overwrite={} dry_run={} workers={} order={} shard={:?}",
-                files.len(),
-                sel_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                sel_rows as f64 / 1e9,
-                inv.total_files(),
-                inv.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
-                overwrite,
+            run_ingest_all(
+                &config,
+                &in_root,
+                &out_root,
+                &classes,
                 dry_run,
                 workers,
-                order,
-                shard,
-            );
-            if dry_run {
-                for f in files.iter().take(20) {
-                    println!(
-                        "  DRY  year={} category={} channel={} bytes={}",
-                        f.identity.year, f.identity.category, f.identity.channel, f.size_bytes
-                    );
-                }
-                if files.len() > 20 {
-                    println!("  ...and {} more", files.len() - 20);
-                }
-                println!("(dry-run; no output written.)");
-                return Ok(());
-            }
-
-            let _ = sweep_tmp(&out_root, &config);
-
-            tracing::info!(
-                workers,
-                order = %order,
-                shard = ?shard,
-                files = files.len(),
-                "ingest-all starting"
-            );
-
-            let summary =
-                ingest_all(&files, &in_root, &out_root, &config, workers).context("ingest-all")?;
-
-            let IngestAllSummary {
-                completed,
-                skipped,
-                failed,
-                bytes_in,
-                bytes_out,
-                rows,
-                rejected_rows,
-                rejected_loses_data,
-                wall,
-                slowest_file,
-                failures: _,
-            } = summary;
-            let mib = 1024.0 * 1024.0;
-            println!(
-                "ingest-all done: completed={} skipped={} failed={} workers={} wall={:.2}s",
-                completed,
-                skipped,
-                failed,
-                workers,
-                wall.as_secs_f64()
-            );
-            if completed > 0 {
-                println!(
-                    "  throughput: raw={:.1} MiB/s rows={:.2} M/s out={:.2} GiB bytes={} rows={} rejected_rows={} slowest_file={:.1}s",
-                    bytes_in as f64 / mib / wall.as_secs_f64(),
-                    rows as f64 / 1e6 / wall.as_secs_f64(),
-                    bytes_out as f64 / (1024.0 * 1024.0 * 1024.0),
-                    bytes_in,
-                    rows,
-                    rejected_rows,
-                    slowest_file.as_secs_f64(),
-                );
-            }
-            if rejected_rows > 0 {
-                if rejected_loses_data {
-                    println!(
-                        "  note: {} trailing record(s) NOT written — the record's data is \
-                         incomplete, so its fields could not be trusted",
-                        rejected_rows
-                    );
-                } else {
-                    println!(
-                        "  note: {} trailing record(s) not written — missing only the line \
-                         terminator; every field of every row is intact",
-                        rejected_rows
-                    );
-                }
-            }
-            if failed > 0 {
-                tracing::warn!(failed, "ingest-all finished with failures");
+                explain_skips,
+            )
+        }
+        Cmd::InventoryOther {
+            input,
+            format,
+            explain_skips,
+        } => {
+            let root = input.unwrap_or_else(|| config.input_root.clone());
+            let invs = dataset::discover_all(&root).context("inventory walk")?;
+            match format {
+                OtherInventoryFormat::Table => print_other_inventory_table(&invs, explain_skips),
+                OtherInventoryFormat::Json => print_other_inventory_json(&invs),
+                OtherInventoryFormat::Paths => print_other_inventory_paths(&invs),
             }
             Ok(())
         }
@@ -294,6 +216,418 @@ fn run(cli: Cli) -> Result<()> {
             }
             run_benchmark(&path, &cfg, repeats)
         }
+    }
+}
+
+/// The sales pipeline: the original `ingest-all`, now `ingest-sales`.
+///
+/// Extracted from `run` rather than inlined so the umbrella can call
+/// exactly the same code for the sales class. One implementation means
+/// the flags, the ordering, the sharding and the reporting cannot drift
+/// between `make ingest-sales` and `make ingest-all`.
+#[allow(clippy::too_many_arguments)]
+fn run_ingest_sales(
+    config: iri_lake::config::IngestConfig,
+    input: Option<std::path::PathBuf>,
+    output_root: Option<std::path::PathBuf>,
+    overwrite: bool,
+    dry_run: bool,
+    max_files: Option<usize>,
+    year: Option<u8>,
+    category: Option<String>,
+    channel: Option<String>,
+    workers: Option<usize>,
+    order: iri_lake::cli::Order,
+    shard: Option<(usize, usize)>,
+) -> Result<()> {
+    let in_root = input.unwrap_or_else(|| config.input_root.clone());
+    let out_root = output_root.unwrap_or_else(|| config.output_root.clone());
+    let channel_filter: Option<Channel> = channel.as_deref().and_then(Channel::parse);
+
+    let inv = discovery::discover(&in_root).context("sales discovery")?;
+    // Largest-first ordering for tail-latency smoothing.
+    let mut files: Vec<_> = inv
+        .files
+        .iter()
+        .filter(|f| match year {
+            Some(y) => f.identity.year == y,
+            None => true,
+        })
+        .filter(|f| match &category {
+            Some(c) => &f.identity.category == c,
+            None => true,
+        })
+        .filter(|f| match channel_filter {
+            Some(c) => f.identity.channel == c,
+            None => true,
+        })
+        .cloned()
+        .collect();
+    files.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
+    if let Some(n) = max_files {
+        files.truncate(n);
+    }
+    let workers = workers.or(config.worker_threads).unwrap_or(1).max(1);
+    order.apply(&mut files, workers);
+    if let Some((idx, n)) = shard {
+        files = take_shard(files, idx, n);
+    }
+
+    // Report the *selected* bytes/rows, not the whole inventory's:
+    // with `--shard`, `--year` or `--max-files` the two differ by an
+    // order of magnitude and the old line made a 4-file shard look
+    // like the full corpus.
+    let sel_bytes: u64 = files.iter().map(|f| f.size_bytes).sum();
+    let sel_rows: u64 = files
+        .iter()
+        .map(|f| iri_lake::fixed_width::expected_rows(f.size_bytes).unwrap_or(0))
+        .sum();
+    println!(
+        "ingest-sales: {} file(s) selected ({:.2} GiB raw, ~{:.3}B rows) of {} discovered ({:.2} GiB); overwrite={} dry_run={} workers={} order={} shard={:?}",
+        files.len(),
+        sel_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        sel_rows as f64 / 1e9,
+        inv.total_files(),
+        inv.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+        overwrite,
+        dry_run,
+        workers,
+        order,
+        shard,
+    );
+    if dry_run {
+        for f in files.iter().take(20) {
+            println!(
+                "  DRY  year={} category={} channel={} bytes={}",
+                f.identity.year, f.identity.category, f.identity.channel, f.size_bytes
+            );
+        }
+        if files.len() > 20 {
+            println!("  ...and {} more", files.len() - 20);
+        }
+        println!("(dry-run; no output written.)");
+        return Ok(());
+    }
+
+    let _ = sweep_tmp(&out_root, &config);
+
+    tracing::info!(
+        workers,
+        order = %order,
+        shard = ?shard,
+        files = files.len(),
+        "ingest-sales starting"
+    );
+
+    let summary =
+        ingest_all(&files, &in_root, &out_root, &config, workers).context("ingest-sales")?;
+
+    let IngestAllSummary {
+        completed,
+        skipped,
+        failed,
+        bytes_in,
+        bytes_out,
+        rows,
+        rejected_rows,
+        rejected_loses_data,
+        wall,
+        slowest_file,
+        failures: _,
+    } = summary;
+    let mib = 1024.0 * 1024.0;
+    println!(
+        "ingest-sales done: completed={} skipped={} failed={} workers={} wall={:.2}s",
+        completed,
+        skipped,
+        failed,
+        workers,
+        wall.as_secs_f64()
+    );
+    if completed > 0 {
+        println!(
+            "  throughput: raw={:.1} MiB/s rows={:.2} M/s out={:.2} GiB bytes={} rows={} rejected_rows={} slowest_file={:.1}s",
+            bytes_in as f64 / mib / wall.as_secs_f64(),
+            rows as f64 / 1e6 / wall.as_secs_f64(),
+            bytes_out as f64 / (1024.0 * 1024.0 * 1024.0),
+            bytes_in,
+            rows,
+            rejected_rows,
+            slowest_file.as_secs_f64(),
+        );
+    }
+    if rejected_rows > 0 {
+        if rejected_loses_data {
+            println!(
+                "  note: {} trailing record(s) NOT written — the record's data is \
+                 incomplete, so its fields could not be trusted",
+                rejected_rows
+            );
+        } else {
+            println!(
+                "  note: {} trailing record(s) not written — missing only the line \
+                 terminator; every field of every row is intact",
+                rejected_rows
+            );
+        }
+    }
+    if failed > 0 {
+        tracing::warn!(failed, "ingest-sales finished with failures");
+    }
+    Ok(())
+}
+
+/// The umbrella: sales (through its own pipeline) then every non-sales
+/// class, sequentially.
+///
+/// Sales runs first because it is the largest and slowest class, and a
+/// run that is going to be interrupted should get the expensive part
+/// done first.
+fn run_ingest_all(
+    config: &iri_lake::config::IngestConfig,
+    in_root: &std::path::Path,
+    out_root: &std::path::Path,
+    classes: &[DatasetKind],
+    dry_run: bool,
+    workers: Option<usize>,
+    explain_skips: bool,
+) -> Result<()> {
+    let workers = workers.or(config.worker_threads).unwrap_or(1).max(1);
+    let sales = classes.contains(&DatasetKind::Sales);
+    let others: Vec<DatasetKind> = classes.iter().copied().filter(|k| !k.is_sales()).collect();
+
+    println!(
+        "ingest-all: {} class(es) selected ({}), workers={}, dry_run={}",
+        classes.len(),
+        classes
+            .iter()
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join(", "),
+        workers,
+        dry_run,
+    );
+
+    if sales {
+        if dry_run {
+            let inv = discovery::discover(in_root).context("sales discovery")?;
+            println!(
+                "  [dry-run] iri_sales: {} file(s), {:.2} GiB raw",
+                inv.total_files(),
+                inv.total_bytes() as f64 / (1024.0 * 1024.0 * 1024.0),
+            );
+        } else {
+            run_ingest_sales(
+                config.clone(),
+                Some(in_root.to_path_buf()),
+                Some(out_root.to_path_buf()),
+                matches!(config.overwrite, iri_lake::config::OverwriteMode::Overwrite),
+                false,
+                None,
+                None,
+                None,
+                None,
+                Some(workers),
+                iri_lake::cli::Order::SmallestFirst,
+                None,
+            )?;
+        }
+    }
+
+    if others.is_empty() {
+        return Ok(());
+    }
+
+    if dry_run {
+        for kind in &others {
+            let inv = dataset::discover(*kind, in_root)?;
+            println!(
+                "  [dry-run] {:<20} files={:<6} bytes={:<12} skipped={}",
+                kind.to_string(),
+                inv.files.len(),
+                umbrella::human_bytes(inv.total_bytes()),
+                inv.skipped.len()
+            );
+            if explain_skips {
+                explain_skip_reasons(&inv);
+            }
+        }
+        println!("(dry-run; no output written.)");
+        return Ok(());
+    }
+
+    let _ = sweep_tmp(out_root, config);
+
+    let summary = umbrella::ingest_all_classes(
+        in_root,
+        out_root,
+        config,
+        &others,
+        workers,
+        |class: &ClassResult| {
+            println!(
+                "  {:<20} files={:<6} rows={:<12} out={:<10} failed={} wall={:.2}s",
+                class.kind.to_string(),
+                class.inventory.files.len(),
+                class.rows(),
+                class
+                    .summary
+                    .as_ref()
+                    .map(|s| umbrella::human_bytes(s.bytes_out))
+                    .unwrap_or_default(),
+                class.failed(),
+                class.wall.as_secs_f64(),
+            );
+            if explain_skips {
+                explain_skip_reasons(&class.inventory);
+            }
+        },
+    )?;
+
+    print!("{}", umbrella::format_summary(&summary));
+    if !summary.ok() {
+        tracing::warn!(
+            failed = summary.total_failed(),
+            "ingest-all finished with failures"
+        );
+        anyhow::bail!(
+            "{} source(s) failed across {} class(es); see metadata/manifest.jsonl",
+            summary.total_failed(),
+            summary.classes.len()
+        );
+    }
+    Ok(())
+}
+
+fn explain_skip_reasons(inv: &dataset::DatasetInventory) {
+    let counts = umbrella::summarise_skips(inv);
+    if counts.is_empty() {
+        return;
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(reason, n)| format!("{reason}={n}"))
+        .collect();
+    println!("        skipped by discovery: {}", parts.join(", "));
+}
+
+fn print_other_inventory_table(invs: &[dataset::DatasetInventory], explain_skips: bool) {
+    println!(
+        "{:<20} {:>7} {:>12} {:>7}  coverage",
+        "dataset", "files", "bytes", "skipped"
+    );
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    for inv in invs {
+        let kind = inv.kind.unwrap_or(DatasetKind::Sales);
+        total_files += inv.files.len();
+        total_bytes += inv.total_bytes();
+        println!(
+            "{:<20} {:>7} {:>12} {:>7}  {}",
+            kind.to_string(),
+            inv.files.len(),
+            umbrella::human_bytes(inv.total_bytes()),
+            inv.skipped.len(),
+            describe_coverage(inv),
+        );
+        if explain_skips {
+            explain_skip_reasons(inv);
+        }
+    }
+    println!(
+        "\nTOTAL files={} bytes={} ({})",
+        total_files,
+        total_bytes,
+        umbrella::human_bytes(total_bytes)
+    );
+}
+
+/// A compact "which years / editions did we find" line.
+fn describe_coverage(inv: &dataset::DatasetInventory) -> String {
+    use std::collections::BTreeSet;
+    let mut years: BTreeSet<u8> = BTreeSet::new();
+    let mut editions: BTreeSet<&str> = BTreeSet::new();
+    let mut categories: BTreeSet<&str> = BTreeSet::new();
+    for f in &inv.files {
+        if let Some(y) = f.source.year {
+            years.insert(y);
+        }
+        if let Some(e) = &f.source.edition {
+            editions.insert(e.as_str());
+        }
+        if let Some(c) = &f.source.category {
+            if !c.is_empty() {
+                categories.insert(c.as_str());
+            }
+        }
+    }
+    let mut parts = Vec::new();
+    if !years.is_empty() {
+        let list: Vec<String> = years.iter().map(|y| y.to_string()).collect();
+        parts.push(format!("years={}", list.join(",")));
+    }
+    if !categories.is_empty() {
+        parts.push(format!("categories={}", categories.len()));
+    }
+    if !editions.is_empty() {
+        parts.push(format!(
+            "editions={}",
+            editions
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("/")
+        ));
+    }
+    parts.join(" ")
+}
+
+fn print_other_inventory_json(invs: &[dataset::DatasetInventory]) {
+    let mut by_class = serde_json::Map::new();
+    let mut total_files = 0usize;
+    let mut total_bytes = 0u64;
+    for inv in invs {
+        let kind = inv.kind.unwrap_or(DatasetKind::Sales);
+        total_files += inv.files.len();
+        total_bytes += inv.total_bytes();
+        let mut reasons = serde_json::Map::new();
+        for (reason, n) in umbrella::summarise_skips(inv) {
+            reasons.insert(reason.to_string(), serde_json::json!(n));
+        }
+        by_class.insert(
+            kind.to_string(),
+            serde_json::json!({
+                "files": inv.files.len(),
+                "bytes": inv.total_bytes(),
+                "skipped_count": inv.skipped.len(),
+                "skipped_reasons": reasons,
+                "coverage": describe_coverage(inv),
+            }),
+        );
+    }
+    let out = serde_json::json!({
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "classes": by_class,
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+}
+
+/// One discovered non-sales source path per line, sorted.
+///
+/// The same contract as `inventory --format paths`: the list comes
+/// from `dataset::discover`, so it cannot drift from what `ingest-all`
+/// would actually touch.
+fn print_other_inventory_paths(invs: &[dataset::DatasetInventory]) {
+    let mut paths: Vec<&std::path::Path> = invs
+        .iter()
+        .flat_map(|inv| inv.files.iter())
+        .map(|f| f.source.path.as_path())
+        .collect();
+    paths.sort_unstable();
+    paths.dedup();
+    for p in paths {
+        println!("{}", p.display());
     }
 }
 

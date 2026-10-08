@@ -5,6 +5,20 @@ strategy; it captures what's on disk, the regularities, and the irregularities.
 
 Totals: **12 years × 31 categories ≈ 145 GB** of raw files, ~2.7 B sales rows.
 
+> **Corrected by measurement.** This survey was written from IRI's
+> documentation. Sniffing all 1110 PANEL headers, all 93 `prod_attr`
+> files and all 372 `Delivery_Stores` files found several places where
+> the data disagrees with what is written below. The corrections are
+> marked inline with **⚠**; the full evidence, and the layout
+> constants that replace each wrong claim, are in
+> [`other_sources.md`](other_sources.md).
+>
+> The most consequential: PANEL has **four** dialects, not three;
+> `prod_attr` has a **21-byte attribute pitch** that whitespace-splitting
+> silently misaligns; and `CENTS998`/`CENTS999` in the trips files are
+> **floats**, not integers. A parser written from this file alone would
+> produce a lake that loads cleanly and is wrong.
+
 ---
 
 ## 1. Top-level layout
@@ -193,11 +207,33 @@ PANEL files are a **different format** than the drug/groc files:
 
 | Years | Delimiter | Columns (header) |
 |---|---|---|
-| 1–2 | tab (`\t`) | `PANID WEEK UNITS OUTLET DOLLARS IRI_KEY COLUPC` |
-| 3–5 | whitespace | same as 1–2 |
-| 6–7 | whitespace | same as 1–2 |
+| 1–3 | tab (`\t`) | `PANID WEEK UNITS OUTLET DOLLARS IRI_KEY COLUPC` |
+| 4–7 | whitespace | same as 1–3 |
 | 8 | comma | `PANID,WEEK,MINUTE,UNITS,OUTLET,DOLLARS,IRI_KEY,COLUPC` (note new `MINUTE` col) |
 | 9–12 | comma | same as 8 |
+
+> **⚠ Corrected.** Years 1–3 are tab, not 1–2 — year 3 ships tab
+> files too. And there is a **fourth** dialect: year 11's
+> `diapers_PANEL_GK_1635_1686.DAT` is **tab-delimited *with* the
+> year-8+ `MINUTE` column**. "Years 8+ are comma-delimited" is wrong for
+> exactly one file out of 1110, and a delimiter inferred from the year
+> mis-parses it silently — a comma split of a tab line yields one
+> field, which is not an error, just a row with no columns.
+>
+> **Treat the delimiter and the MINUTE presence as two independent
+> facts, both read from the header line.** A year-based lookup cannot
+> get this right.
+
+> **⚠ Also: `UNITS` and `DOLLARS` have three encodings.** Exact
+> 2-decimal (`6.99`), a 32-bit float rendering of one
+> (`0.7299998474`), and a genuinely sub-cent computed average
+> (`4.3091992188`). The third is 0.4 % of all PANEL rows and is
+> concentrated — 12.7 % of `Year10/carbbev`'s `PANEL_GK`. A strict
+> integer-cent parser nulls out **67 783 real dollar amounts**.
+
+> **⚠ And: two PANEL files are zero bytes** — `Year1/beer`'s `PANEL_DR`
+> and one Year-2 equivalent. They have no header at all, so a parser
+> that requires one turns them into permanent failures.
 
 The `OUTLET` codes also change across years:
 
@@ -217,6 +253,25 @@ store-level weekly aggregates.
 ---
 
 ## 4. `Delivery_Stores` — store roster
+
+> **⚠ Corrected.** This file is **fixed-width at 63 bytes**, not
+> whitespace-aligned — all 37 200 data rows across all 372 files are
+> exactly 63 bytes. And the header's own token positions do **not**
+> match the data's field positions, so slicing by them lands mid-field:
+>
+> ```text
+> header  IRI_KEY@0  OU@8  EST_ACV@11  Market_Name@20  Open@45  Clsd@50  MskdName@55
+> data     200039@1   GR@8  9.709999@11 BUFFALO/…@20     539@46   1219@50   Chain87@55
+> ```
+>
+> The right-padded `IRI_KEY` is what throws the first field off by
+> one. The measured layout is
+> `IRI_KEY [0..8) OU [8..11) EST_ACV [11..20) Market [20..45) Open
+> [45..50) Clsd [50..55) MskdName [55..63)`.
+>
+> `Open`/`Clsd` are **IRI week numbers** in the same 1114–1739 space as
+> `iri_sales.week`, with `9998` as the "still delivering" sentinel — a
+> value, not a null.
 
 Found in every (year, category) directory. ~2 000 stores per year, ~2 MB. The
 `Y1` year shows **6 distinct MD5s** across 31 categories — meaning there are 6
@@ -254,6 +309,31 @@ attributes.
 
 ---
 
+## 5.1 `<category>_prod_attr` — item attribute dictionary
+
+> **Not in the original survey.** Years 9–11 only, 93 files, 608 MB.
+> Fixed-width, but **not** at the header's token positions: a 27-byte
+> key prefix (`SY GE VEND ITEM VOL_EQ`) followed by **N attribute
+> columns of exactly 21 bytes**, where `N = ceil((row_len - 27) / 21)`.
+>
+> Three traps, all of which produce a lake that loads cleanly and is
+> wrong:
+>
+> - Whitespace-splitting misaligns, because `MISSING` padded to 21 bytes
+>   makes two adjacent missing attributes look like one 42-byte field.
+> - **The count is a `ceil`, not a floor.** `(row_len - 47) / 21` gives
+>   29 for `Year9/beer`'s 656-byte rows, one short — it drops the 30th
+>   attribute (`WINE/LIQUOR TYPE`, with real values) in all 93 files,
+>   because the 20-byte remainder looks exactly like padding.
+> - **The header is 4 bytes shorter than the rows** (652 vs 656): its
+>   last slot holds a 16-character name, the row's a 21-wide value
+>   field. One length cannot slice both.
+>
+> A value can also **overflow its slot**: `Year9/beer`'s `PACKAGE` is
+> `LONG NECK BTL IN BOX BEER`, 25 bytes in a 21-byte field, so its last
+> four bytes land at the start of the next column and `BEER` reads as
+> `PRODUCT TYPE`. The grid is still exactly 21 bytes in every row.
+
 ## 6. Product stubs
 
 Four directories cover the 12 years with drifting filename codes:
@@ -277,6 +357,23 @@ the year × category matrix that maps each code to a canonical category.
 | `trips1 jul08.csv` … `trips7 jul08.csv` | 500 K–730 K/yr | Household-trip records (years 1–7) |
 | `trips8 may13.csv` … `trips12 may13.csv` | 395 K–315 K/yr | Household-trip records (years 8–12) |
 | `trips8/9/10/11 may13.zip` | — | Compressed duplicates of years 8–11 trips CSVs |
+
+> **⚠ Corrected: `CENTS998` / `CENTS999` / `KRYSCENTS` are floats,
+> not integers.** The corpus holds `4470.8359375` and `4600.316406` —
+> 32-bit float renderings of 2-decimal amounts (`float32(4470.84)` is
+> `4470.8359375`). Parsing them as integers nulls **4.6 M of 7.2 M
+> rows**, silently. They are also not comparable to
+> `iri_sales.dollars_cents`: the unit is IRI's own scaled unit, the
+> corpus ships no codebook for it, and the values are plainly dollars
+> (`4470.84` is a plausible trip total; `$44.71` is not).
+>
+> `CENTS998` is genuinely empty in 92–97 % of rows, which is a fact
+> about the corpus, not a parse failure.
+>
+> **⚠ And: the ad-panel files use two stems.** `ads demo<n>` for years
+> 1–8 and `ads demos<n>` for years 9–12, with `.csv` and `.CSV` mixed
+> — 24 directory entries, not 12. Matching only the `demo` stem silently
+> drops years 9–11.
 | `static 1_12.csv` | 87 051 | Panelist + Trip_Count + make_static flag by year |
 | `static 1_7.csv` | 47 767 | Same, years 1–7 only |
 | `static1_5.csv` | 30 154 | Same, years 1–5 only |
@@ -372,6 +469,28 @@ needed for sales/stub ingestion.
     existing `readfwf` uses `Threads.@spawn` per row and is single-machine
     memory-safe; do not load a whole year into RAM without chunking.
 
-12. **Week lookup is missing for years 6 and 7.** If you need calendar dates
-    in those years, you'll have to interpolate from the surrounding years'
-    `IRI week translation*.xls` or hard-code.
+12. **Week lookup is missing for years 6 and 7** — *in the per-year
+    copies*. `demos trips external/IRI week translation.xls` covers the
+    full **1114–1739** range with a `Year` column and is the only copy
+    that includes years 6 and 7. The 311 per-year files are subsets of
+    it (the year-1 copy starts at week 1138, not 1114), so ingest the
+    external copy and skip the rest.
+
+---
+
+## 11. Corrections index
+
+Every claim above marked **⚠**, with its evidence in
+[`other_sources.md`](other_sources.md):
+
+| § | claim | reality |
+|---|---|---|
+| 3.3 | PANEL has 3 dialects, years 1–2 tab / 3–7 whitespace | **4** dialects; years 1–3 tab; one year-11 file is tab **with** MINUTE |
+| 3.3 | PANEL `DOLLARS` is a 2-decimal decimal | **three** encodings; 0.4 % sub-cent, concentrated in `carbbev` |
+| 3.3 | — | two PANEL files are **zero bytes** |
+| 4 | `Delivery_Stores` is space-aligned | fixed-width **63 B**; header offsets are off by one |
+| 4 | `Open`/`Clsd` are dates | IRI **week numbers**, `9998` = open-ended |
+| 5.1 | *(not covered)* | `prod_attr` exists: 93 files, 608 MB, 21-byte attribute pitch |
+| 7 | trips money are cents | **floats**; 4.6 M of 7.2 M rows nulled if parsed as ints |
+| 7 | 12 `ads demo*.csv` | **two stems**, two extension cases, 24 entries |
+| 12 | week lookup missing for years 6–7 | true of the per-year copies; the external copy has them |

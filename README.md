@@ -13,17 +13,36 @@ data/raw/    ──►   iri-lake ingest   ──►   data/lake/bronze/iri_sale
 
 ## Scope
 
-This first version handles **store-level weekly sales** files only:
+`data/raw/` is not one data source. Alongside the store-level sales
+files it holds **ten more structurally distinct classes**, and this
+tool now ingests all of them:
 
-```
-<category>_drug_<week_start>_<week_end>
-<category>_groc_<week_start>_<week_end>
-```
+| dataset | files | rows | source format |
+|---|---:|---:|---|
+| `iri_sales` | 744 | 2.7 B | fixed-width, 56 B/row |
+| `iri_panel` | 1 108 | 16.5 M | delimited, **4 dialects** |
+| `iri_product_attr` | 93 | 643 K | fixed-width, 21 B attribute pitch |
+| `iri_panel_trips` | 12 | 7.2 M | CSV, 2 dialects |
+| `iri_panelist_demos` | 217 (14 canonical) | 1.1 M (75 K written) | CSV, 2 dialects |
+| `iri_product_stub` | 124 | 635 K | `.xls` / `.xlsx` |
+| `iri_delivery_stores` | 372 (59 canonical) | 763 K (120 K written) | fixed-width, 63 B/row |
+| `iri_week_dimension` | 1 | 626 | `.xls` |
+| `iri_ads_demos` | 7 | 55 K | CSV |
+| `iri_chain_xref`, `iri_manual_store_entry` | 3 | 436 | CSV |
 
-It does **not** parse PANEL files, product stubs, `Delivery_Stores`,
-`DEMOS.CSV`, Excel files, trips files, or documentation. Those file
-classes are explicitly skipped at discovery time so they cannot enter
-the sales parser by accident.
+Everything else — 626 `.doc`, 16 `.pdf`, 4 `.zip`, Office lock files,
+`.bak`/`.OLD` stragglers — is explicitly skipped at discovery time, and
+the *reason* is reported rather than swallowed.
+
+`iri_sales` keeps its own pipeline: it is 143 GB across 744 files with a
+measured parallelism sweep and five documented gates behind it. The
+other ten share a generic driver — same manifest, same skip decision,
+same atomic Parquet write, same failure-is-a-value policy — but their
+own discovery and parsers.
+
+The survey behind all of this, including the places where the corpus
+contradicts `docs/data_layout.md`, is in
+[`docs/other_sources.md`](docs/other_sources.md).
 
 ## Why a specialised fixed-width parser
 
@@ -182,8 +201,32 @@ iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 # Convert one file into Parquet.
 iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 
-# Walk the input tree, validate every file, and ingest everything,
-# skipping sources already covered by a successful manifest record.
+# Walk the input tree and report the ten non-sales datasets. Writes
+# nothing. `--explain-skips` shows *why* files were skipped, which is
+# the part that matters when a class reports zero sources.
+iri-lake inventory-other --input data/raw --explain-skips
+
+# The sales pipeline: the original `ingest-all`, renamed and unchanged.
+# 744 files, 143 GB. See docs/parallelism.md for the measured
+# parallelism and docs/corpus_readiness.md for the gates.
+iri-lake ingest-sales --input data/raw --output-root data/lake
+
+# The umbrella: ingest-sales, then every non-sales dataset. Classes run
+# sequentially and each is resumable at dataset grain.
+#
+#   --only panel,stubs   restrict to these classes (repeatable)
+#   --skip stubs         exclude classes (repeatable)
+#   --no-sales           umbrella over the non-sales classes only
+#   --explain-skips      print each class's skip reasons
+#   --dry-run            discover and report, write nothing
+iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
+
+# Ingest the ten non-sales classes on their own: 2.05 GiB -> 27.0 M
+# rows in ~11 s at 8 workers. This is the target to iterate on; the
+# sales path is unchanged underneath it.
+iri-lake ingest-all --input data/raw --output-root data/lake --no-sales
+
+# Previously: ingest-all meant sales only. That is now `ingest-sales`.
 #
 # Skipping is the DEFAULT (no flag needed) — this is what lets an
 # interrupted full-corpus run simply be re-issued.
@@ -206,7 +249,7 @@ iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 # ingested, the trailing one is counted in `rejected_rows`, and the
 # severity (missing terminator vs missing fields) decides whether that
 # is an info line or a warning.
-iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
+iri-lake ingest-sales --input data/raw --output-root data/lake --workers 8
 
 # Run parser / Arrow / Parquet micro-benchmarks on one file.
 iri-lake benchmark data/raw/Year1/beer/beer_drug_1114_1165 \
@@ -229,7 +272,7 @@ Global flags (also configurable via env: `IRI_LAKE_BATCH_ROWS`,
   ([`BENCHMARKING.md`](BENCHMARKING.md) § *Measured codec sweep*).
 - `--worker-threads <N>` — defaults to logical CPU count, capped at 16;
   `ingest-all`'s `--workers` overrides it per run
-- `--order <smallest-first|largest-first|striped>` — how `ingest-all`
+- `--order <smallest-first|largest-first|striped>` — how `ingest-sales`
   deals its work list to workers. `smallest-first` is the default and is
   the fastest measured (docs/parallelism.md §3)
 
@@ -239,7 +282,8 @@ A source is skippable only if a prior `manifest.jsonl` entry satisfies
 **all** of:
 
 - `status == "success"`,
-- `source_path`, `source_size_bytes`, `source_sha256` all match,
+- `dataset`, `source_path`, `source_size_bytes`, `source_sha256` all
+  match,
 - `parser_version`, `output_schema_version`, `compression`,
   `batch_rows`, `row_group_rows` all match,
 - the recorded `output_paths` still exist on disk.
@@ -312,11 +356,18 @@ strictly downstream: nothing in `cargo build` depends on it, and DuckDB
 simply reads the Parquet files the binary writes.
 
 ```bash
-make gate2                       # validate every discovered source (~7 min)
+make gate2                       # validate every discovered sales source (~7 min)
 make gate5                       # Gate 5 of docs/corpus_readiness.md
-make gate5 LAKE=/tmp/some-lake   # ...against any other output root
+make gate6                       # reconcile the non-sales tables + cross-table joins
+make gate6 LAKE=/tmp/some-lake   # ...against any other output root
 make sql SQL=sql/my_query.sql    # any file in sql/
 ```
+
+`sql/gate6_non_sales.sql` checks what a row-count match cannot: that
+the manifest and the lake agree per class, that every week referenced
+by sales or panel resolves to a calendar date, that the week dimension
+covers all twelve years, that every sales store has a roster row, and
+that no column is silently empty where the corpus says it is not.
 
 `sql/gate5_reconciliation.sql` holds the reconciliation queries; each
 one returns a boolean `gate_5x_ok` column, and `scripts/run_sql.py`

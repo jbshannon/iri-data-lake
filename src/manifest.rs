@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::errors::IngestError;
-use crate::model::{ManifestRecord, ManifestStatus, CURRENT_SCHEMA_VERSION};
+use crate::model::{ManifestRecord, ManifestStatus};
 
 /// Abstract store. Implementations may use JSONL, SQLite, or Parquet.
 ///
@@ -226,13 +226,19 @@ pub fn skip_decision(
     if prior.status != ManifestStatus::Success {
         return Ok(None);
     }
-    if prior.output_schema_version != CURRENT_SCHEMA_VERSION {
-        return Ok(None);
-    }
     // The prospective record is still InProgress at decision time; check
     // the relevant config-affecting fields directly rather than calling
     // `matches_for_skip` (which is intended for two finalised records).
+    //
+    // `output_schema_version` is compared **record against record**, not
+    // against the crate-wide `CURRENT_SCHEMA_VERSION`. The sales class
+    // happens to be the crate's version, so hard-coding it was invisible
+    // there — but every other class declares its own, and a check
+    // against `CURRENT_SCHEMA_VERSION` rejects all of them, so no
+    // non-sales source could ever be skipped and a re-run silently
+    // re-ingested all of them into new files.
     if prior.source_path != current.source_path
+        || prior.dataset != current.dataset
         || prior.source_size_bytes != current.source_size_bytes
         || prior.source_sha256 != current.source_sha256
         || prior.parser_version != current.parser_version
@@ -266,14 +272,17 @@ mod tests {
     fn dummy_record(path: &Path, status: ManifestStatus) -> ManifestRecord {
         ManifestRecord {
             run_id: "test".into(),
+            dataset: crate::model::DatasetKind::Sales,
             source_path: path.to_path_buf(),
             source_size_bytes: 100,
             source_sha256: "abc".into(),
-            source_year: 1,
-            category: "beer".into(),
-            channel: Channel::Drug,
-            filename_week_start: 1,
-            filename_week_end: 52,
+            source_year: Some(1),
+            category: Some("beer".into()),
+            channel: Some(Channel::Drug),
+            filename_week_start: Some(1),
+            filename_week_end: Some(52),
+            deduplicated_from: None,
+            source_schema_fingerprint: None,
             expected_rows: 10,
             written_rows: 10,
             rejected_rows: 0,
