@@ -287,6 +287,8 @@ pub enum DatasetKind {
     DeliveryStores,
     /// IRI week → calendar date dimension.
     WeekDimension,
+    /// FIPS county → IRI market cross-reference.
+    FipsMarket,
     /// Masked chain cross-reference by year.
     ChainXref,
     /// Manual store → chain entry by year.
@@ -315,6 +317,7 @@ impl DatasetKind {
             "productstub" | "stub" => ProductStub,
             "deliverystores" => DeliveryStores,
             "weekdimension" | "weeks" => WeekDimension,
+            "fipsmarket" | "fips" => FipsMarket,
             "chainxref" => ChainXref,
             "manualstoreentry" => ManualStoreEntry,
             _ => return None,
@@ -335,6 +338,7 @@ impl DatasetKind {
             ProductStub => "iri_product_stub",
             DeliveryStores => "iri_delivery_stores",
             WeekDimension => "iri_week_dimension",
+            FipsMarket => "iri_fips_market",
             ChainXref => "iri_chain_xref",
             ManualStoreEntry => "iri_manual_store_entry",
         }
@@ -355,6 +359,7 @@ impl DatasetKind {
         use DatasetKind::*;
         &[
             WeekDimension,
+            FipsMarket,
             DeliveryStores,
             PanelStatic,
             ChainXref,
@@ -383,6 +388,7 @@ impl DatasetKind {
             PanelTrips => PANEL_TRIPS_SCHEMA_VERSION,
             PanelStatic => PANEL_STATIC_SCHEMA_VERSION,
             WeekDimension => WEEK_DIMENSION_SCHEMA_VERSION,
+            FipsMarket => FIPS_MARKET_SCHEMA_VERSION,
             // The remaining three have a per-file schema; the version
             // tracks the writer, the fingerprint tracks the columns.
             ProductAttr | ProductStub | PanelistDemos | AdsDemos | ChainXref | ManualStoreEntry => {
@@ -432,7 +438,7 @@ impl DatasetKind {
             DeliveryStores => &["year"],
             PanelTrips => &["year"],
             PanelStatic | AdsDemos => &[],
-            WeekDimension | ChainXref | ManualStoreEntry => &[],
+            WeekDimension | FipsMarket | ChainXref | ManualStoreEntry => &[],
         }
     }
 }
@@ -491,6 +497,29 @@ pub const PANEL_STATIC_SCHEMA_VERSION: u32 = 1;
 /// every consumer. `week_end` uses IRI's own week-end convention
 /// (Sunday), which is what the workbook documents.
 pub const WEEK_DIMENSION_SCHEMA_VERSION: u32 = 1;
+
+/// Output-schema version for the `FipsMarket` class.
+///
+/// v1: 8 columns — `fips_key`, `name`, `county`, `state`, `market_name`,
+/// `region_name`, `iri_market_number`, `market_name2`. The FIPS code is
+/// stored as `UInt32` (it is a 4-5 digit county code), and the IRI
+/// market number is `UInt16` (values 0-999).
+///
+/// **v2**: the seven string columns become **nullable**, and an absent
+/// source cell becomes `NULL` instead of `""`. v1 conflated "the source
+/// did not say" with "known to be blank", so a consumer's
+/// `WHERE county IS NULL` returned zero rows on a table that might
+/// contain unknowns — the coverage audit that could not fail. v2 also
+/// stops an Excel `#REF!`/`#N/A` from landing as a blank county name,
+/// which v1 flattened along with genuine blanks.
+///
+/// The corpus has no absent cells in this workbook's data sheet (the
+/// three `Empty` cells are all in the `Notes` documentation sheet), so
+/// this is a correctness fix with no change to today's row values. It
+/// bumps the version anyway, because the *schema* changed and a
+/// resume must re-read rather than trust a v1 Parquet file whose
+/// columns are declared NOT NULL.
+pub const FIPS_MARKET_SCHEMA_VERSION: u32 = 2;
 
 /// Convenience: the canonical bronze root for sales facts.
 pub fn bronze_root(output_root: &Path) -> PathBuf {

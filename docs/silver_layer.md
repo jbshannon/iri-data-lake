@@ -203,11 +203,24 @@ home for that; Silver's job is to make the *dimensions* correct and joinable.
 
 ### 5.1 Calendar — `silver_week_dimension`
 
-**Bronze prerequisite (not yet built).** Ingest the IRI Week Translation `.xls` files:
-`IRI week translation.xls` (years 1–5, per category directory) and
-`IRI week translation_2008_2017.xls` (years 8–12). This is the `calamine` thread already
-open on this branch (`Cargo.toml` + `examples/probe_excel.rs`). Output:
-`bronze/iri_week/week=<week>.parquet` or one file per source, keyed by `WEEK`.
+**Bronze prerequisite — built.** Ingest the IRI Week Translation `.xls`
+files with [`calamine`]: `demos trips external/IRI week
+translation.xls`, which covers **all 626 weeks, 1114–1739**, years
+1–12. The 311 per-year copies in the category directories are subsets
+of it (the Year-1 copy starts at week 1138, not 1114) and are reported
+as skipped. Output: `bronze/iri_week_dimension/`, one flat Parquet
+file, keyed by `week`. See [`excel_to_bronze.md`](excel_to_bronze.md)
+§3.
+
+> **The year 6–7 gap does not exist.** §9.1 asked whether the missing
+> per-year translations for years 6 and 7 left a hole in the week
+> mapping. Measured over the ingested table: no hole. All twelve years
+> are present, years 6 and 12 have 53 weeks and the rest have 52, and
+> every week spans exactly 6 days (Monday–Sunday). The gap policy below
+> therefore reduces to a single tier — `date_source` is uniformly
+> `'captured'` and there is nothing to interpolate. The policy is kept
+> because it is the right shape for a table whose coverage is incomplete
+> *in general*, but it does not bind for this corpus.
 
 **Grain.** One row per IRI `WEEK` (1114–1739, contiguous and non-overlapping; years 6 and
 12 have 53 weeks). This is the smallest and highest-leverage table in the lake.
@@ -259,7 +272,9 @@ The heaviest domain: duplication, masking, and SCD all at once.
 2. `masked_chain_xref*.csv` — chain cross-reference; note three overlapping windows
    (`1_5`, `1_7`, `1_12` reconstruction) plus a top-level duplicate. Ingest the widest
    (`1_12`) and record that the narrower ones are subsets.
-3. `fips by IRI market.xls` — FIPS county → IRI market. Excel, so `calamine`.
+3. `fips by IRI market.xls` — FIPS county → IRI market. **Built**:
+   `bronze/iri_fips_market/`, 3 141 rows, one per county, 65 IRI markets
+   across 9 regions. See [`excel_to_bronze.md`](excel_to_bronze.md) §4.
 4. `panel complete store list with chains.xlsx` — optional enrichment, decide later.
 
 **Grain.** `silver_store`: one row per (`iri_key`, `source_year`) — a store's attributes
@@ -299,12 +314,14 @@ vs one-year anomaly) before it becomes a dimension value rather than a null.
 
 ### 5.3 Product master — `silver_product`, `silver_product_attribute`
 
-**Bronze prerequisites.** ~200 MB of stubs in four directories: `parsed stub files/`
+**Bronze prerequisites — built.** ~200 MB of stubs in four directories: `parsed stub files/`
 (yrs 1–6, `.xls`/BIFF), `parsed stub files 2007/` (yr 7), `parsed stub files 2008-2011/`
-(yrs 8–11, `prod11_` prefix), `parsed stub files 2012/` (yr 12, `prod12_` prefix). Skip
-the three `_sz` size variants and `~$prod_factiss.xlsx`. `calamine`'s `open_workbook_auto`
+(yrs 8–11, `prod11_` prefix), `parsed stub files 2012/` (yr 12, `prod12_` prefix). 124 files,
+634 824 rows, 23.2 MiB, partitioned by `edition`. The three `_sz` size variants and
+`~$prod_factiss.xlsx` are excluded by discovery. `calamine`'s `open_workbook_auto`
 covers both BIFF and OOXML in one reader, which is the argument for doing this in Rust
-rather than the `xlrd` + `openpyxl` pair the Julia/Python path assumed.
+rather than the `xlrd` + `openpyxl` pair the Julia/Python path assumed. See
+[`excel_to_bronze.md`](excel_to_bronze.md) §5.
 
 **Filename drift is the first problem, not the parsing.** The stub filename codes drift
 across the four directories, and the canonical category mapping is already tracked in git
@@ -316,10 +333,66 @@ years; the union is upserted by UPC with `first_seen_year`/`last_seen_year`, so 
 absent in year *n* but present in *n+1* is a gap, not a delete.
 
 **Keys.** `silver_product.upc` (or `item`/`vend` split as the stub provides) joins to
-`iri_sales.vend`/`iri_sales.item`. The join is **not** 1:1 — the sales file's `VEND`/`ITEM`
-pair is an IRI item code, not a UPC — so the stub→sales key correspondence must be
-established empirically before any view claims to join. If it cannot be established, the
-stub tables stay dimensions for description and do not pretend to enrich sales.
+`iri_sales.vend`/`iri_sales.item`. The join is **not** on UPC — it is on the
+4-tuple `(SY, GE, VEND, ITEM)`, and the `VEND`/`ITEM` pair is an IRI item code, not a UPC.
+Verified below (§9.2); the two ways to get it wrong are recorded in
+*How stubs join to sales* below.
+
+### How stubs join to sales
+
+Measured against the real corpus — `beer`, `blades` and `yogurt`, all 12
+years, **327 M sales rows**:
+
+```sql
+SELECT s.*, st.UPC, st.L9 AS item_desc, st.PRODUCT_TYPE
+FROM   iri_sales s
+JOIN   iri_product_stub st
+  ON   st.edition = <the edition covering s.year>   -- REQUIRED
+  AND  st.SY = s.sy AND st.GE = s.ge
+  AND  st.VEND = s.vend AND st.ITEM = s.item
+```
+
+| | measured |
+|---|---|
+| key coverage | **100%** — 0 unmatched keys, every year, every category |
+| fan-out | **max 1** — many-to-one, no duplicates |
+| row-count inflation | **0.000000%** |
+
+Two ways to get this wrong, both of which produce plausible numbers:
+
+**1. Omitting the edition scoping.** The four stub editions cover
+overlapping years, so the same item key appears in up to four of them.
+Joining all editions at once fans out to **4x** and silently doubles
+revenue. Map year → edition explicitly: years 1–6 → `2001-2006`,
+7 → `2007`, 8–11 → `2008-2011`, 12 → `2012`.
+
+**2. Narrowing the key.** All four columns are load-bearing — the fact
+that dropping one causes fan-out is what proves it is not redundant:
+
+| join key | keys matched | max fan-out |
+|---|---:|---:|
+| `SY, GE, VEND, ITEM` | 55 523 | **1** |
+| `GE, VEND, ITEM` | 55 523 | 3 |
+| `VEND, ITEM` | 55 523 | 6 |
+| `VEND, ITEM`, all editions | 55 523 | 15 |
+
+**3. Reading the stubs without `union_by_name`.** The stubs are a
+per-file-schema class, and DuckDB's default glob read takes one file's
+schema:
+
+```sql
+read_parquet('.../iri_product_stub/**/*.parquet')                     -- 22 columns
+read_parquet('.../iri_product_stub/**/*.parquet', union_by_name=true) -- 94 columns
+```
+
+Both return all 634 824 rows. The obvious query silently drops 72
+attribute columns, including `PACKAGE` and `TYPE_OF_BEER/ALE`. Any
+Silver view over the stubs must pass `union_by_name = true`.
+
+**`MISSING` is not `NULL`.** 20.5% of `FLAVOR_SCENT` values are the
+literal string `MISSING`, not a null — IRI wrote it deliberately. A view
+that counts known attributes with `IS NOT NULL` will overcount by every
+one. See [`excel_to_bronze.md`](excel_to_bronze.md) §8.
 
 **`prod_attr`** (years 9–11 only) is a per-UPC attribute text table, not a stub. Treat as
 optional enrichment with an explicit year range; its absence in years 1–8 and 12 must
@@ -369,10 +442,10 @@ these five rows.
 
 | Silver table | Grain (one row per…) | Natural key | Joins to `iri_sales` on | Blocking Bronze prerequisite |
 |---|---|---|---|---|
-| `silver_week_dimension` | IRI week | `week` | `week` | Excel ingest of week translation (.xls) |
+| `silver_week_dimension` | IRI week | `week` | `week` | **done** — `iri_week_dimension`, 626 weeks |
 | `silver_store` | store per year | (`iri_key`, `source_year`) | `iri_key` + year | `Delivery_Stores` ingest + MD5 canonicalisation |
 | `silver_chain` | chain per year | (`chain_id`, `source_year`) | via `silver_store` | `masked_chain_xref` ingest |
-| `silver_product` | UPC per year | (`upc`, `source_year`) | `vend`/`item` (**unverified**) | stub ingest (.xls/.xlsx) + filename matrix |
+| `silver_product` | UPC per year | (`upc`, `source_year`) | `(sy, ge, vend, item)`, year-scoped to the stub edition (**verified**) | **done** — 124 stubs, 634 824 rows |
 | `silver_panel_trip` | household purchase | (`panid`, `week`, `iri_key`, `upc`) | **none** (different grain) | PANEL 3-format ingest + trips CSV |
 | `silver_household` | panelist | `panid` | **none** | `DEMOS.CSV` ingest + dedup |
 
@@ -398,10 +471,15 @@ column ending `_ok`, non-zero exit). Candidates, in rough order of value:
 
 ## 8. Sequencing
 
+**Step 1 is done.** See [`excel_to_bronze.md`](excel_to_bronze.md) for
+what was built, measured, and tested.
+
 Prerequisites before any Silver view is worth writing:
 
-1. **Excel → Bronze** (calamine): week translation first. It is the smallest source, has
-   the fewest consumers, and unblocks the highest-value join. Stubs second, fips third.
+1. ~~**Excel → Bronze** (calamine): week translation first. It is the smallest source, has
+   the fewest consumers, and unblocks the highest-value join. Stubs second, fips third.~~
+   **Done** — week translation (626 weeks), FIPS market (3 141 counties) and the stubs
+   (124 workbooks, 634 824 rows) are all in the lake; 203 tests pass, clippy clean.
 2. **`Delivery_Stores` → Bronze with MD5 canonicalisation** — needed for any store-keyed
    analysis and for the SCD design to be testable.
 3. Then the §5.1 and §5.2 views, then a Silver gate.
@@ -409,10 +487,17 @@ Prerequisites before any Silver view is worth writing:
 
 ## 9. Open questions
 
-1. **Years 6–7 week translation.** Verify against `demos trips external/` whether the gap is
-   fully or partly covered before fixing the interpolation policy (§5.1).
-2. **Stub → sales key correspondence.** Does `iri_sales.vend`/`item` join to a UPC in the
-   stubs? Unverified, and §5.3's usefulness depends on it.
+1. **Years 6–7 week translation.** ~~Verify against `demos trips external/` whether the gap is
+   fully or partly covered before fixing the interpolation policy (§5.1).~~ **Resolved:
+   fully covered.** The authoritative workbook spans all 626 weeks with no gap, so no
+   interpolation policy is needed and `date_source` is uniformly `'captured'`. See
+   [`excel_to_bronze.md`](excel_to_bronze.md) §3.
+2. ~~**Stub → sales key correspondence.** Does `iri_sales.vend`/`item` join to a UPC in the
+   stubs?~~ **Resolved.** The key is the 4-tuple `(SY, GE, VEND, ITEM)`, **not** a UPC, and
+   all four columns are required. Measured on `beer`/`blades`/`yogurt` across all 12 years
+   (327 M sales rows): **100% key coverage, fan-out max 1, row inflation 0.000000%**.
+   §5.3 *How stubs join to sales* has the SQL, the year→edition mapping, and the two ways
+   to get it wrong.
 3. **`KK` channel (year 8 only).** Real channel for one year, or an anomaly to be folded
    into an existing channel?
 4. **Chain xref window.** `1_12` reconstruction is a *reconstruction* — is it authoritative

@@ -162,6 +162,9 @@ pub enum Cmd {
         /// Skip these dataset classes. Repeatable.
         #[arg(long = "skip", value_name = "CLASS")]
         skip: Vec<String>,
+        /// Skip sources whose manifest already shows a successful run.
+        #[arg(long)]
+        resume: bool,
         /// Overwrite any existing Parquet outputs.
         #[arg(long)]
         overwrite: bool,

@@ -14,7 +14,7 @@ data/raw/    ──►   iri-lake ingest   ──►   data/lake/bronze/iri_sale
 ## Scope
 
 `data/raw/` is not one data source. Alongside the store-level sales
-files it holds **ten more structurally distinct classes**, and this
+files it holds **eleven more structurally distinct classes**, and this
 tool now ingests all of them:
 
 | dataset | files | rows | source format |
@@ -27,6 +27,7 @@ tool now ingests all of them:
 | `iri_product_stub` | 124 | 635 K | `.xls` / `.xlsx` |
 | `iri_delivery_stores` | 372 (59 canonical) | 763 K (120 K written) | fixed-width, 63 B/row |
 | `iri_week_dimension` | 1 | 626 | `.xls` |
+| `iri_fips_market` | 1 | 3 141 | `.xls` |
 | `iri_ads_demos` | 7 | 55 K | CSV |
 | `iri_chain_xref`, `iri_manual_store_entry` | 3 | 436 | CSV |
 
@@ -36,9 +37,9 @@ the *reason* is reported rather than swallowed.
 
 `iri_sales` keeps its own pipeline: it is 143 GB across 744 files with a
 measured parallelism sweep and five documented gates behind it. The
-other ten share a generic driver — same manifest, same skip decision,
-same atomic Parquet write, same failure-is-a-value policy — but their
-own discovery and parsers.
+other eleven share a generic driver — same manifest, same skip
+decision, same atomic Parquet write, same failure-is-a-value policy —
+but their own discovery and parsers.
 
 The survey behind all of this, including the places where the corpus
 contradicts `docs/data_layout.md`, is in
@@ -201,7 +202,7 @@ iri-lake validate data/raw/Year1/beer/beer_drug_1114_1165
 # Convert one file into Parquet.
 iri-lake ingest data/raw/Year1/beer/beer_drug_1114_1165 --output-root data/lake
 
-# Walk the input tree and report the ten non-sales datasets. Writes
+# Walk the input tree and report the eleven non-sales datasets. Writes
 # nothing. `--explain-skips` shows *why* files were skipped, which is
 # the part that matters when a class reports zero sources.
 iri-lake inventory-other --input data/raw --explain-skips
@@ -221,7 +222,7 @@ iri-lake ingest-sales --input data/raw --output-root data/lake
 #   --dry-run            discover and report, write nothing
 iri-lake ingest-all --input data/raw --output-root data/lake --workers 8
 
-# Ingest the ten non-sales classes on their own: 2.05 GiB -> 27.0 M
+# Ingest the eleven non-sales classes on their own: 2.05 GiB -> 27.0 M
 # rows in ~11 s at 8 workers. This is the target to iterate on; the
 # sales path is unchanged underneath it.
 iri-lake ingest-all --input data/raw --output-root data/lake --no-sales

@@ -59,6 +59,7 @@ lake AS (
     UNION ALL SELECT 'product_stub',     count(*) FROM read_parquet('${LAKE}/bronze/iri_product_stub/**/*.parquet')
     UNION ALL SELECT 'delivery_stores',  count(*) FROM read_parquet('${LAKE}/bronze/iri_delivery_stores/**/*.parquet')
     UNION ALL SELECT 'week_dimension',   count(*) FROM read_parquet('${LAKE}/bronze/iri_week_dimension/**/*.parquet')
+    UNION ALL SELECT 'fips_market',      count(*) FROM read_parquet('${LAKE}/bronze/iri_fips_market/**/*.parquet')
     UNION ALL SELECT 'chain_xref',       count(*) FROM read_parquet('${LAKE}/bronze/iri_chain_xref/**/*.parquet')
     UNION ALL SELECT 'manual_store_entry', count(*) FROM read_parquet('${LAKE}/bronze/iri_manual_store_entry/**/*.parquet')
 )
@@ -105,6 +106,43 @@ SELECT
     max(iri_week)                                     AS hi,
     count(DISTINCT source_year)                       AS years
 FROM dim;
+
+-- 6.3b: the FIPS market cross-reference is one row per county.
+--
+-- `fips_key` is the natural key, so a duplicate would make a join to a
+-- store roster fan out silently — every downstream market rollup would
+-- double-count and nothing would error. The empty-string check is the
+-- guard against reading the workbook's 10-row `Notes` documentation
+-- sheet as if it were data, which produces a table that loads cleanly
+-- and is useless.
+--
+-- The NULL and '' checks are separate on purpose. Since schema v2 the
+-- string columns are nullable and an absent source cell becomes NULL,
+-- so `county = ''` and `county IS NULL` mean different things: the
+-- first is a value the source published, the second is a value it did
+-- not. A v1 table declared these NOT NULL and wrote '', which made
+-- the coverage audit below (`IS NULL` = 0) unable to fail.
+WITH fips AS (SELECT * FROM read_parquet('${LAKE}/bronze/iri_fips_market/**/*.parquet'))
+SELECT
+    '6.3b FIPS market table is one row per county'  AS check,
+    count(*) = count(DISTINCT fips_key)
+        AND count(*) > 1000
+        AND count(*) FILTER (WHERE fips_key IS NULL) = 0
+        AND count(*) FILTER (WHERE name = '') = 0
+        AND count(*) FILTER (WHERE county = '') = 0
+        AND count(*) FILTER (WHERE market_name = '') = 0
+        AND count(*) FILTER (WHERE region_name = '') = 0 AS gate_63b_ok,
+    count(*)                                         AS rows,
+    count(DISTINCT fips_key)                         AS distinct_keys,
+    min(fips_key)                                    AS lo,
+    max(fips_key)                                    AS hi,
+    count(DISTINCT iri_market_number)                AS markets,
+    count(DISTINCT region_name)                      AS regions,
+    -- Reported, not asserted: unknown county names are expected to
+    -- stay at 0 for this workbook, but a non-zero value is a finding
+    -- to investigate rather than a gate failure.
+    count(*) FILTER (WHERE county IS NULL)           AS county_null
+FROM fips;
 
 -- 6.4: every store in the sales facts has a roster row for its year.
 -- This is the join that turns `iri_sales.iri_key` into a place, and a
