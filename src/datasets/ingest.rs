@@ -331,6 +331,10 @@ pub fn ingest_dataset_file(
         error_message: None,
     };
 
+    // Output paths this run supersedes, reaped only after the
+    // replacement is durably recorded. See the end of this function.
+    let mut prior_outputs_to_remove: Vec<PathBuf> = Vec::new();
+
     if let Some(prior_ok) = skip_decision(&prospective, prior.as_ref())? {
         match config.overwrite {
             OverwriteMode::SkipIfPresent => return Ok(DatasetOutcome::Skipped(prior_ok)),
@@ -346,9 +350,32 @@ pub fn ingest_dataset_file(
                     prior_run = %prior_ok.run_id,
                     "overwriting prior output (--overwrite)"
                 );
-                // Reap only after the replacement is durably recorded.
-                let _ = reap(&prior_ok.output_paths);
+                // Each output filename embeds *this* run's short id, so
+                // the new files cannot collide with the prior run's and
+                // nothing is replaced in place. Stash the prior set and
+                // reap it once the new one lands.
+                prior_outputs_to_remove = prior_ok.output_paths.clone();
             }
+        }
+    } else if let Some(prior) = prior.as_ref() {
+        // No skip, but a prior record exists: the schema version, the
+        // parser version, the compression or a batch size changed, so
+        // the Parquet files it produced are stale. This run supersedes
+        // them whether or not `--overwrite` was given — leaving them
+        // beside the new ones is what makes a table read back with the
+        // right row count twice, which is the failure Gate 6's 6.1
+        // row-count reconciliation exists to catch.
+        //
+        // (Observed on the FIPS v1 -> v2 schema change: 3 141 rows
+        // written, 6 282 read back, because the v1 file was orphaned.)
+        prior_outputs_to_remove = prior.output_paths.clone();
+        if !prior_outputs_to_remove.is_empty() {
+            tracing::info!(
+                source = %path.display(),
+                superseded = prior_outputs_to_remove.len(),
+                "re-ingesting because output-affecting inputs changed; \
+                 prior output will be reaped"
+            );
         }
     }
 
@@ -404,6 +431,12 @@ pub fn ingest_dataset_file(
     };
     store.append(&record)?;
 
+    // Reap the superseded output set, and only now: the replacement is
+    // written and recorded, so an interrupted run leaves the old output
+    // in place rather than leaving the source with neither. The sales
+    // pipeline does the same (`src/ingest.rs`), for the same reason.
+    reap(&prior_outputs_to_remove, &record.output_paths);
+
     if rows == 0 {
         Ok(DatasetOutcome::Empty(record))
     } else {
@@ -411,14 +444,21 @@ pub fn ingest_dataset_file(
     }
 }
 
-/// Delete output paths a `--overwrite` run has superseded.
+/// Delete output paths this run has superseded.
+///
+/// `keep` is the set of paths this run just wrote; a path in both sets
+/// is never deleted, which is what stops a same-named output from being
+/// removed out from under the manifest record that now claims it.
 ///
 /// Best-effort, like the tmp sweep and like the sales pipeline's own
 /// reap: these are inert files, and failing to remove one must not fail
 /// an otherwise-successful ingest. It does silently double that
 /// source's footprint, so each failure is logged.
-fn reap(paths: &[PathBuf]) -> Result<()> {
+fn reap(paths: &[PathBuf], keep: &[PathBuf]) {
     for p in paths {
+        if keep.contains(p) {
+            continue;
+        }
         match std::fs::remove_file(p) {
             Ok(()) => tracing::debug!(path = %p.display(), "removed superseded output"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -429,7 +469,6 @@ fn reap(paths: &[PathBuf]) -> Result<()> {
             ),
         }
     }
-    Ok(())
 }
 
 /// Summary of one dataset class's run.

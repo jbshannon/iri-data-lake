@@ -248,6 +248,7 @@ pub fn discover(kind: DatasetKind, input_root: &Path) -> Result<DatasetInventory
     use crate::datasets::{csv, delivery_stores, excel, panel, product_attr};
     let mut inv = match kind {
         DatasetKind::WeekDimension => excel::discover_week_dimension(input_root),
+        DatasetKind::FipsMarket => excel::discover_fips_market(input_root),
         DatasetKind::DeliveryStores => delivery_stores::discover(input_root),
         DatasetKind::PanelStatic => csv::discover_panel_static(input_root),
         DatasetKind::ChainXref => csv::discover_chain_xref(input_root),

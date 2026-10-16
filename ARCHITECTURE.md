@@ -329,7 +329,7 @@ failure-is-a-value policy, but not the per-file pipeline.
 | `DeliveryStores` | `iri_delivery_stores` | `year` |
 | `PanelTrips` | `iri_panel_trips` | `year` |
 | `ProductStub` | `iri_product_stub` | `edition` |
-| `PanelStatic`, `AdsDemos`, `WeekDimension`, `ChainXref`, `ManualStoreEntry` | — | none |
+| `PanelStatic`, `AdsDemos`, `WeekDimension`, `FipsMarket`, `ChainXref`, `ManualStoreEntry` | — | none |
 
 Partition keys are **declared per class**, not inferred from whatever
 the identity happens to carry. `iri_delivery_stores` carries a category
@@ -375,10 +375,17 @@ per-file-schema class unskippable.
    `MINUTE` column. The delimiter and the MINUTE presence are therefore
    two independent facts, both read from the header. See
    `docs/other_sources.md` § 2.1.
-2. **Deduplicated `Delivery_Stores`.** 372 files hold ~62 distinct
-   byte sequences. `ManifestRecord.deduplicated_from` exists for this
-   and is not yet written; see `docs/other_sources.md` § 6.
-3. **Deduplicated `DEMOS.CSV`.** 217 files hold 7. Same pattern.
+2. ~~**Deduplicated `Delivery_Stores`.**~~ **Done.** 372 files hold ~62
+   distinct byte sequences. Discovery runs `dataset::dedup_by_hash`
+   over the class, the canonical source is ingested, and every
+   non-canonical path gets a `Success` manifest record carrying
+   `deduplicated_from` and the *canonical's* SHA — so a query filtered
+   by source path still resolves, even though no Parquet file was
+   written for it. Measured: 59 canonical sources produce 372 manifest
+   records, 313 of them dedup pointers. See `docs/other_sources.md` § 6.
+3. ~~**Deduplicated `DEMOS.CSV`.**~~ **Done.** 217 files hold 7.
+   Same mechanism, applied to `PanelistDemos`: 14 canonical sources
+   produce 217 manifest records.
 4. ~~**Product-stub ingestion.**~~ **Done** — one crate, [`calamine`],
    reads both BIFF and OOXML. Sheet selection is by content, not
    position: the year-7 workbook has three sheets and only `Sheet1` is

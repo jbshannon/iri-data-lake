@@ -37,6 +37,9 @@ use crate::model::{DatasetKind, WEEK_DIMENSION_SCHEMA_VERSION};
 
 pub const WEEK_BATCH_ROWS: usize = 10_000;
 pub const STUB_BATCH_ROWS: usize = 100_000;
+/// The FIPS table is 3 141 rows and never grows; one batch is the
+/// whole workbook, so the batch and file budgets are the same number.
+pub const FIPS_BATCH_ROWS: usize = 10_000;
 
 // ---------------------------------------------------------------------
 // iri_week_dimension
@@ -706,6 +709,273 @@ fn is_ignored(path: &Path, input_root: &Path) -> bool {
     name.starts_with('.')
 }
 
+// ---------------------------------------------------------------------
+// iri_fips_market
+// ---------------------------------------------------------------------
+
+/// The FIPS market cross-reference schema.
+///
+/// One row per FIPS county code, mapping it to an IRI market name.
+/// The corpus file has 3 141 data rows and 8 columns.
+///
+/// The seven string columns are **nullable**, and an absent cell
+/// becomes `NULL` rather than `""`. That is the convention
+/// `docs/silver_layer.md` §4 sets ("NULLs mean 'unknown', never
+/// 'zero'") and the one [`StubParser`] in this same file already
+/// follows. It is also the only encoding a consumer's
+/// `WHERE county IS NULL` can see: an empty string reads as a
+/// *known-to-be-blank* county, which is a claim the source never
+/// makes.
+pub fn fips_market_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("fips_key", DataType::UInt32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("county", DataType::Utf8, true),
+        Field::new("state", DataType::Utf8, true),
+        Field::new("market_name", DataType::Utf8, true),
+        Field::new("region_name", DataType::Utf8, true),
+        Field::new("iri_market_number", DataType::UInt16, true),
+        Field::new("market_name2", DataType::Utf8, true),
+    ]))
+}
+
+/// The FIPS market parser.
+///
+/// Reads the `fips by IRI market` sheet from the workbook. The sheet
+/// is recognised by its header row (containing `Key` and `MARKET NAME`),
+/// not by its position — the workbook leads with a documentation sheet.
+#[derive(Debug)]
+pub struct FipsMarketParser {
+    rows: Vec<FipsMarketRow>,
+    source_label: String,
+}
+
+/// One row of the FIPS market table.
+///
+/// The strings are `Option<String>`: `None` is "the source did not
+/// say", which is a different claim from `Some("")`.
+type FipsMarketRow = (
+    u32,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    u16,
+    Option<String>,
+);
+
+impl FipsMarketParser {
+    pub fn open(path: &Path, _source: &SourceRef) -> Result<Self> {
+        let mut wb = calamine::open_workbook_auto(path)
+            .map_err(|e| IngestError::Discovery(format!("open {}: {e}", path.display())))?;
+        let sheet = pick_fips_sheet(&mut wb, path).ok_or_else(|| {
+            IngestError::Discovery(format!(
+                "{}: no sheet has a 'Key' / 'MARKET NAME' header",
+                path.display()
+            ))
+        })?;
+        let range = wb.worksheet_range(&sheet).map_err(|e| {
+            IngestError::Discovery(format!("read {sheet:?} in {}: {e}", path.display()))
+        })?;
+
+        let mut rows = Vec::new();
+        for (i, r) in range.rows().enumerate() {
+            if i == 0 {
+                continue; // header
+            }
+            let key = match r.first() {
+                Some(calamine::Data::Float(v)) if *v >= 0.0 => *v as u32,
+                Some(calamine::Data::Int(v)) if *v >= 0 => *v as u32,
+                _ => continue,
+            };
+            let name = cell_string(r.get(1));
+            let county = cell_string(r.get(2));
+            let state = cell_string(r.get(3));
+            let market_name = cell_string(r.get(4));
+            let region_name = cell_string(r.get(5));
+            let market_num = match r.get(6) {
+                Some(calamine::Data::Float(v)) if *v >= 0.0 => *v as u16,
+                Some(calamine::Data::Int(v)) if *v >= 0 => *v as u16,
+                _ => continue,
+            };
+            let market_name2 = cell_string(r.get(7));
+            rows.push((
+                key,
+                name,
+                county,
+                state,
+                market_name,
+                region_name,
+                market_num,
+                market_name2,
+            ));
+        }
+        rows.sort_by_key(|r| r.0);
+        rows.dedup_by_key(|r| r.0);
+        Ok(Self {
+            rows,
+            source_label: path.display().to_string(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// Recognise the FIPS market sheet by its header.
+///
+/// The workbook has two sheets: `Notes` (documentation) and
+/// `fips by IRI market` (the data). The data sheet is recognised by
+/// looking for `Key` and `MARKET NAME` in its first row.
+fn pick_fips_sheet(wb: &mut Sheets<std::io::BufReader<File>>, path: &Path) -> Option<String> {
+    for name in wb.sheet_names().to_vec() {
+        let Ok(range) = wb.worksheet_range(&name) else {
+            continue;
+        };
+        let Some(first) = range.rows().next() else {
+            continue;
+        };
+        let joined: String = first
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        if joined.contains("key") && joined.contains("market name") {
+            return Some(name);
+        }
+    }
+    let _ = path;
+    None
+}
+
+/// Extract a string cell, returning `None` for "the source did not say".
+///
+/// Three things this deliberately does *not* collapse into `""`:
+///
+/// - an absent cell (`None`) and `Data::Empty` — the cell was never
+///   populated;
+/// - `Data::String("")` — populated, but blank;
+/// - `Data::Error(_)` — an Excel `#REF!` / `#N/A` / `#DIV/0!`. This is
+///   the case that would have been the most damaging: a broken
+///   formula in the source becomes a county named "nothing", which
+///   joins to nothing and reports as coverage. The corpus has no
+///   error cells today (verified with
+///   `probe_excel --scan`), so this is a guard against a future
+///   workbook revision rather than a fix to today's data.
+///
+/// Numbers become strings because a market name that happens to be
+/// stored as a number is still a market name, and widening on read is
+/// lossless where silently substituting `""` would not be.
+fn cell_string(cell: Option<&calamine::Data>) -> Option<String> {
+    match cell {
+        Some(calamine::Data::String(s)) if !s.is_empty() => Some(s.clone()),
+        Some(calamine::Data::String(_)) => None,
+        Some(calamine::Data::Float(v)) => Some(format!("{v}")),
+        Some(calamine::Data::Int(v)) => Some(v.to_string()),
+        _ => None,
+    }
+}
+
+impl DatasetParser for FipsMarketParser {
+    fn schema(&self) -> SchemaRef {
+        fips_market_schema()
+    }
+
+    fn parse(&mut self, sink: &mut BatchSink, cfg: &IngestConfig) -> Result<()> {
+        if self.rows.is_empty() {
+            return Ok(());
+        }
+        let mut key = UInt32Builder::with_capacity(self.rows.len());
+        let cap = self.rows.len();
+        let mut name = StringBuilder::with_capacity(cap, cap * 32);
+        let mut county = StringBuilder::with_capacity(cap, cap * 16);
+        let mut state = StringBuilder::with_capacity(cap, cap * 16);
+        let mut market_name = StringBuilder::with_capacity(cap, cap * 32);
+        let mut region_name = StringBuilder::with_capacity(cap, cap * 16);
+        let mut market_num = UInt16Builder::with_capacity(self.rows.len());
+        let mut market_name2 = StringBuilder::with_capacity(cap, cap * 32);
+        for (k, n, c, s, mn, rn, num, mn2) in self.rows.drain(..) {
+            key.append_value(k);
+            for (b, v) in [
+                (&mut name, n),
+                (&mut county, c),
+                (&mut state, s),
+                (&mut market_name, mn),
+                (&mut region_name, rn),
+                (&mut market_name2, mn2),
+            ] {
+                match v {
+                    Some(t) => b.append_value(t),
+                    None => b.append_null(),
+                }
+            }
+            market_num.append_value(num);
+        }
+        let batch = RecordBatch::try_new(
+            fips_market_schema(),
+            vec![
+                Arc::new(key.finish()),
+                Arc::new(name.finish()),
+                Arc::new(county.finish()),
+                Arc::new(state.finish()),
+                Arc::new(market_name.finish()),
+                Arc::new(region_name.finish()),
+                Arc::new(market_num.finish()),
+                Arc::new(market_name2.finish()),
+            ],
+        )?;
+        sink.push(batch, cfg)?;
+        Ok(())
+    }
+
+    fn expected_rows(&self) -> Option<u64> {
+        Some(self.len() as u64)
+    }
+
+    fn note(&self) -> Option<String> {
+        Some(format!("workbook={}", self.source_label))
+    }
+}
+
+pub fn fips_market_parser(path: &Path, source: &SourceRef) -> Result<Box<dyn DatasetParser>> {
+    Ok(Box::new(FipsMarketParser::open(path, source)?))
+}
+
+pub fn fips_market_tuning() -> DatasetTuning {
+    DatasetTuning::new(
+        FIPS_BATCH_ROWS,
+        FIPS_BATCH_ROWS,
+        fips_market_parser as ParserFactory,
+    )
+}
+
+/// Discover the FIPS market workbook.
+///
+/// The corpus has exactly one: `demos trips external/fips by IRI
+/// market.xls`. It is a small file (~3 140 rows) that maps FIPS
+/// county codes to IRI market names.
+pub fn discover_fips_market(input_root: &Path) -> Result<DatasetInventory> {
+    let mut inv = DatasetInventory::new(DatasetKind::FipsMarket);
+    let external = input_root.join("demos trips external");
+    let fips = external.join("fips by IRI market.xls");
+    if fips.is_file() {
+        let size = std::fs::metadata(&fips).map(|m| m.len()).unwrap_or(0);
+        inv.files.push(DatasetFile {
+            kind: DatasetKind::FipsMarket,
+            source: SourceRef::new(&fips).with_edition("full"),
+            size_bytes: size,
+        });
+    }
+    Ok(inv)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -836,5 +1106,154 @@ mod tests {
         assert_eq!(STUB_EDITIONS[0].1, "prod");
         assert_eq!(STUB_EDITIONS[2].1, "prod11");
         assert_eq!(STUB_EDITIONS[3].1, "prod12");
+    }
+
+    #[test]
+    fn the_fips_market_schema_has_eight_typed_columns() {
+        let s = fips_market_schema();
+        assert_eq!(s.fields().len(), 8);
+        let expected: [(&str, DataType); 8] = [
+            ("fips_key", DataType::UInt32),
+            ("name", DataType::Utf8),
+            ("county", DataType::Utf8),
+            ("state", DataType::Utf8),
+            ("market_name", DataType::Utf8),
+            ("region_name", DataType::Utf8),
+            ("iri_market_number", DataType::UInt16),
+            ("market_name2", DataType::Utf8),
+        ];
+        for (i, (name, dt)) in expected.iter().enumerate() {
+            assert_eq!(s.field(i).name(), name, "column {i}");
+            assert_eq!(s.field(i).data_type(), dt, "column {name}");
+        }
+        // The key is non-nullable: a row without a FIPS code has no
+        // identity, and the parser skips such rows rather than writing
+        // them with a null key.
+        assert!(!s.field(0).is_nullable());
+
+        // The string columns are nullable, and an absent source cell becomes
+        // NULL rather than "".
+        //
+        // This is the same choice [`StubParser`] makes in this file
+        // (`Data::Empty => b.append_null()`), and it is the only one a
+        // coverage audit can see: `WHERE county IS NULL` returns 0 on a
+        // v1 table that might contain unknowns, because v1 wrote `""`.
+        for (name, _) in expected.iter().skip(1) {
+            assert!(
+                s.field_with_name(name).unwrap().is_nullable(),
+                "{name} must be nullable so an absent cell is visible as unknown"
+            );
+        }
+    }
+
+    /// `cell_string` must not collapse three distinct "no value here"
+    /// cases into one answer.
+    ///
+    /// An absent cell, an explicitly blank cell, and an Excel error
+    /// (`#REF!`, `#N/A`, `#DIV/0!`) are three different facts about
+    /// the source. v1 mapped all three to `""`, which made a broken
+    /// formula indistinguishable from a genuinely blank county name.
+    /// The corpus has no error cells today — verified with
+    /// `probe_excel --scan` — so this guards a future workbook
+    /// revision rather than fixing today's data.
+    #[test]
+    fn an_absent_or_errored_cell_is_none_not_an_empty_string() {
+        use calamine::Data;
+        // Present and populated.
+        assert_eq!(
+            cell_string(Some(&Data::String("Autauga".into()))),
+            Some("Autauga".to_string())
+        );
+        // A number stored in a text column still reads as a string.
+        assert_eq!(
+            cell_string(Some(&Data::Float(140.0))),
+            Some("140".to_string())
+        );
+        // Blank, absent, and errored are all "the source did not say".
+        assert_eq!(cell_string(Some(&Data::String(String::new()))), None);
+        assert_eq!(cell_string(Some(&Data::Empty)), None);
+        assert_eq!(cell_string(None), None);
+        // Every Excel error code is "the source did not say", not a
+        // value. `#REF!` is the one that would do real damage: v1
+        // turned a broken formula into a county named nothing, which
+        // joins to nothing and reports as coverage.
+        for e in [
+            calamine::CellErrorType::Ref,
+            calamine::CellErrorType::NA,
+            calamine::CellErrorType::Div0,
+            calamine::CellErrorType::Value,
+            calamine::CellErrorType::Name,
+            calamine::CellErrorType::Null,
+            calamine::CellErrorType::Num,
+            calamine::CellErrorType::GettingData,
+        ] {
+            assert_eq!(
+                cell_string(Some(&Data::Error(e.clone()))),
+                None,
+                "{e:?} must not become a county named nothing"
+            );
+        }
+        // The regression this guards: None and Some("") are different.
+        assert_ne!(cell_string(None), Some(String::new()));
+    }
+
+    /// The FIPS key must not be narrowed to `UInt16`.
+    ///
+    /// `fips_key` in the corpus runs to 56 045, and FIPS county keys are
+    /// five digits for the states with high codes. This guards the
+    /// *declared width* rather than the data: a "tighten the types"
+    /// change that reached `UInt16` would still fit today's maximum
+    /// with 9 490 values to spare, and would silently truncate the
+    /// six-digit and state-prefixed forms the census also defines.
+    /// The observed range is pinned against the real workbook in
+    /// `the_fips_market_table_parses_with_types_that_fit_the_data`.
+    #[test]
+    fn fips_key_is_u32_and_the_market_number_is_u16() {
+        let s = fips_market_schema();
+        assert_eq!(s.field(0).data_type(), &DataType::UInt32, "fips_key");
+        assert_ne!(
+            s.field(0).data_type(),
+            &DataType::UInt16,
+            "narrowing fips_key to UInt16 is the regression this guards"
+        );
+        // Observed 0-148 across 65 distinct markets, so UInt16 is
+        // generous but correct; a UInt8 would truncate real values.
+        assert_eq!(
+            s.field(6).data_type(),
+            &DataType::UInt16,
+            "iri_market_number"
+        );
+        assert_ne!(
+            s.field(6).data_type(),
+            &DataType::UInt8,
+            "narrowing iri_market_number to UInt8 would truncate it"
+        );
+    }
+
+    /// The FIPS table is one batch and one output file.
+    ///
+    /// The table is 3 141 rows. If the file budget were ever smaller
+    /// than the batch, `BatchSink::push` would split the batch and
+    /// write several Parquet files for what is conceptually one small
+    /// table — harmless but noisy, and it would make the lake's file
+    /// count depend on a tuning constant that has nothing to do with
+    /// the data.
+    #[test]
+    fn the_fips_table_is_one_batch_and_one_file() {
+        let t = fips_market_tuning();
+        assert_eq!(
+            t.batch_rows, t.max_rows_per_file,
+            "batch and file budgets must match, or one table becomes many files"
+        );
+        assert!(t.batch_rows > 0, "a zero budget would write no rows at all");
+    }
+
+    /// The week table is likewise one batch and one file, for the same
+    /// reason: 626 rows in one workbook.
+    #[test]
+    fn the_week_table_is_one_batch_and_one_file() {
+        let t = week_tuning();
+        assert_eq!(t.batch_rows, t.max_rows_per_file);
+        assert!(t.batch_rows > 0);
     }
 }

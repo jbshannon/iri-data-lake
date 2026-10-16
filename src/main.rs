@@ -48,7 +48,8 @@ fn run(cli: Cli) -> Result<()> {
     // Resolve the skip/overwrite policy once, up front, so that a
     // contradictory pair of flags fails before any work starts.
     let resume = matches!(&cli.cmd, Cmd::Ingest { resume, .. } if *resume)
-        || matches!(&cli.cmd, Cmd::IngestSales { resume, .. } if *resume);
+        || matches!(&cli.cmd, Cmd::IngestSales { resume, .. } if *resume)
+        || matches!(&cli.cmd, Cmd::IngestAll { resume, .. } if *resume);
     let overwrite = matches!(&cli.cmd, Cmd::IngestSales { overwrite, .. } if *overwrite)
         || matches!(&cli.cmd, Cmd::IngestAll { overwrite, .. } if *overwrite);
     config.overwrite = cli
@@ -163,6 +164,7 @@ fn run(cli: Cli) -> Result<()> {
             output_root,
             only,
             skip,
+            resume: _,
             overwrite: _,
             dry_run,
             no_sales,

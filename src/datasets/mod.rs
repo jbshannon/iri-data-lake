@@ -48,6 +48,7 @@ pub fn tuning_for(kind: DatasetKind) -> Result<DatasetTuning, IngestError> {
         PanelistDemos => csv::demos_tuning(csv::panel_demos_parser as ingest::ParserFactory),
         AdsDemos => csv::demos_tuning(csv::ads_demos_parser as ingest::ParserFactory),
         WeekDimension => excel::week_tuning(),
+        FipsMarket => excel::fips_market_tuning(),
         ProductStub => excel::stub_tuning(),
         ChainXref => csv::chain_xref_tuning(),
         ManualStoreEntry => csv::manual_store_entry_tuning(),
