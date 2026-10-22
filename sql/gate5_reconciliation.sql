@@ -1,4 +1,7 @@
--- Gate 5 — reconcile the lake against the manifest and the inventory.
+-- Gate 5 — reconcile the sales lake against its manifest records and inventory.
+-- The shared manifest also records non-sales Bronze datasets, so every manifest
+-- check below is scoped to sales. Legacy sales records omit `dataset`; SQL treats
+-- NULL as `sales`, matching the manifest reader's backward-compatible default.
 --
 -- Run with:  make gate5        (or, against another root:
 --           LAKE=/tmp/somewhere make gate5)
@@ -28,6 +31,7 @@
 WITH m AS (
     SELECT source_path, source_year, status, written_rows, rejected_rows
     FROM read_json_auto('${LAKE}/metadata/manifest.jsonl')
+    WHERE coalesce(dataset, 'sales') = 'sales'
 ),
 disk AS (
     SELECT count(*) AS disk_rows
@@ -68,6 +72,7 @@ WITH m AS (
            sum(rejected_rows) AS rejected_rows,
            count(*) FILTER (WHERE status = 'success') AS success_records
     FROM read_json_auto('${LAKE}/metadata/manifest.jsonl')
+    WHERE coalesce(dataset, 'sales') = 'sales'
 )
 SELECT
     manifest_rows,
@@ -120,6 +125,7 @@ SELECT
     count(*)                    AS records,
     count(DISTINCT source_path) = 62 AND count(*) = 62 AS ok
 FROM read_json_auto('${LAKE}/metadata/manifest.jsonl')
+WHERE coalesce(dataset, 'sales') = 'sales'
 GROUP BY source_year
 ORDER BY source_year;
 
@@ -134,6 +140,7 @@ SELECT
     AND
     (SELECT count(*) FROM (
         SELECT source_year FROM read_json_auto('${LAKE}/metadata/manifest.jsonl')
+        WHERE coalesce(dataset, 'sales') = 'sales'
         GROUP BY source_year
         HAVING count(DISTINCT source_path) = 62 AND count(*) = 62
     )) = 12                                   AS gate_5c_ok;

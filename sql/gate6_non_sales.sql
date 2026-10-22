@@ -28,6 +28,7 @@
 WITH latest AS (
     SELECT
         *,
+        coalesce(dataset, 'sales') AS normalized_dataset,
         row_number() OVER (
             PARTITION BY source_path ORDER BY started_at DESC, run_id DESC
         ) AS rn
@@ -36,7 +37,7 @@ WITH latest AS (
 ),
 manifest AS (
     SELECT
-        dataset,
+        normalized_dataset AS dataset,
         sum(written_rows) AS rows,
         count(*)          AS files
     FROM latest
@@ -48,6 +49,8 @@ manifest AS (
 -- … while the bronze table is `iri_sales`, `iri_panel`, …; the mapping
 -- lives in `DatasetKind::bronze_table()` and is spelled out here rather
 -- than guessed, so a new class that forgets to add itself fails loudly.
+-- Pre-generalization sales manifest rows omit `dataset`; Rust deserializes
+-- that field's default as Sales, so SQL normalizes NULL to `sales` too.
 lake AS (
     SELECT 'sales'            AS dataset, count(*) AS n FROM read_parquet('${LAKE}/bronze/iri_sales/**/*.parquet')
     UNION ALL SELECT 'panel',            count(*) FROM read_parquet('${LAKE}/bronze/iri_panel/**/*.parquet')
