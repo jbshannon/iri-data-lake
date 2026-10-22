@@ -1,7 +1,40 @@
 # The Silver layer — plan
 
-Status: **plan only**. Nothing in this document is implemented. Every SQL block is a
-sketch of the shape a view would take, not a committed gate file.
+Status: **in progress**. The product-key crosswalk and product-week aggregate have been
+profiled, validated, and materialized to Silver Parquet. The full Bronze rerun is complete;
+Gates 5 and 6 pass. The remaining Silver objects are still plans.
+
+## Decisions recorded
+
+These decisions were agreed during the Silver kickoff. They supersede conflicting draft
+assumptions below. The Bronze rerun is complete and reconciled by Gates 5 and 6.
+
+1. **Calendar view.** Create `silver_week_dimension_v`, one row per IRI week, with the
+   required public columns `week`, `calendar_start_date`, and `calendar_end_date`, sourced
+   from the Bronze week dimension. The 626-week mapping is captured and complete.
+2. **Store identity.** Create an internal surrogate `store_id` for each annual store
+   observation. Treat `iri_key` as year-scoped, not as a cross-year store identity; sales
+   resolve to the annual store row using year plus `iri_key`. Masked chain names identify
+   chain membership, not individual physical stores. Link annual store rows to chains
+   separately and do not infer physical-store continuity from a shared chain name.
+   Validate that `(source_year, iri_key)` is unique in the roster before using it as the
+   annual alternate key; refine it with an additional source discriminator if needed.
+3. **Market lookup.** Model markets independently of stores. Use the IRI market number as
+   the market key, retain the county-to-market mapping from the FIPS Bronze source, and
+   create a market-name crosswalk for matching store-roster labels to market numbers. Link
+   annual store IDs to markets through that crosswalk—not by matching a market code to a
+   store ID. Keep unmatched or ambiguous labels visible until resolved.
+4. **Product-week sales building block.** Create `silver_product_week_v` at grain
+   `(upc, week)`, summing `units` and exact `dollars_cents` across stores, categories, and
+   sales channels. Preserve `(sy, ge, vend, item) ↔ upc` in a separate
+   `silver_product_key_xref_v` so the aggregate retains its UPC-week grain. Full Bronze
+   profiling found 324,745 complete mappings, one-to-one in both directions; the 790 stub
+   rows without complete keys are excluded from the crosswalk and sales coverage is gated.
+   The view evaluation took 66.39 s; Parquet materialization took 68.53 s for the aggregate
+   (350,825,041 bytes) and 0.07 s for the crosswalk (3,213,051 bytes).
+
+The market-name matching rules and annual store-key uniqueness still require focused
+validation before the store and market views are built.
 
 ## Preface
 
@@ -51,32 +84,25 @@ a silent wrong answer — a trip-level household table joined to a store-week ag
 produces plausible numbers that are simply not counts of anything. The grain inventory is
 the highest-leverage page in this document.
 
-**As-of, not last-write-wins, for anything that changes over time (§5.2).** Store chain
-assignment genuinely drifts across 12 years. Collapsing it to current state would make 1998
-beer sales join to a 2018 chain name — and that failure is invisible in output, because the
-number still adds up. Effective-dating forces the decision into the schema and makes the
-as-of join the only join that works.
+**Preserve time scope for anything that changes (§5.2).** Store and chain attributes vary
+across years. Resolve sales to the annual store observation using year plus `iri_key`; use
+year-scoped chain relationships rather than carrying a current label backward. Use finer
+effective dating only if a source supplies it.
 
-**Content hash, not filename, is identity (§5.2, §5.4).** `Delivery_Stores` appears 31
-times per year with 6 distinct contents; `DEMOS.CSV` is 31 copies of one panelist pool;
-three files exist at both the top level and under `demos trips external/`. Dedup on
-filename silently loses the fact that the copies *were* copies; dedup on content hash keeps
-one canonical row set plus an explicit provenance mapping. If two copies ever diverge,
-that becomes a finding instead of a silent overwrite.
+**Content hash, not filename, is identity (§5.2, §5.4).** `Delivery_Stores` and
+`DEMOS.CSV` have repeated content across source paths; some files also have differing
+content editions. Dedup on filename can lose that distinction. Content-based canonical rows
+plus explicit provenance make copies auditable and divergences visible.
 
-**A gap is labelled, not filled (§5.1, §5.3, §5.4).** Years 6–7 have no week translation,
-`prod_attr` exists only for years 9–11, `DEMOS.CSV` only for years 3–5 and 8–11. The
-temptation is to interpolate or to coalesce to a default so joins stay quiet. Then
-`WHERE date_source = 'captured'` returns different answers before and after someone
-"improves" the coverage, and the date a consumer sees stops being traceable. `NULL` plus a
-`date_source` label keeps the meaning stable as coverage improves.
+**A gap is labelled, not filled (§5.3, §5.4).** `prod_attr` exists only for years 9–11
+and `DEMOS.CSV` only for years 3–5 and 8–11. Keep these coverage gaps explicit instead of
+interpolating or coalescing unknown values to defaults. The authoritative week workbook,
+by contrast, covers all 626 weeks, so the initial calendar view has no date gap to label.
 
-**Derive what is derivable, store what is captured.** The rule already recorded in
-`ARCHITECTURE.md`, and the reason `source_year` stays a view expression over
-`week_to_year` rather than a persisted column (§5.1). Storing it would let a row exist
-whose `week` and `source_year` disagree, and would cost a byte per row to make that
-possible. `calendar_start_date` *is* stored, because it needs a join to another table —
-the join is the justification, not the derivability.
+**Derive what is derivable, expose what is captured.** The rule already recorded in
+`ARCHITECTURE.md` is why `source_year` can remain a view expression over
+`week_to_year` rather than a persisted column (§5.1). The calendar dates, by contrast,
+are captured in the Bronze week dimension and exposed directly by the Silver view.
 
 **Views first, tables on a stated criterion (§3).** With 2.7 B rows beneath them, a
 materialised Silver table is expensive to be wrong about and cheap to delay. Promotion
@@ -90,9 +116,8 @@ is validation nobody runs. The Sentinel sweep of Gate 5d is the model, and §7 l
 Silver checks that would follow it — deliberately not written yet, because this layer's
 design is not agreed and an executable check becomes a contract.
 
-The honest counterweight to all of this is §9.6: the calendar dimension may be the entire
-near-term requirement. The other four domains are drafted so their shape is settled, not
-so they all get built.
+The calendar view is the agreed first Silver deliverable. The other domains are planned
+separately and should follow only after their keys and joins have been validated.
 
 Two questions were left open when this was drafted; the defaults chosen were:
 
@@ -120,9 +145,9 @@ where they get fixed:
 
 | Problem | Source | Bronze's behaviour today | Silver's fix |
 |---|---|---|---|
-| **Duplication** | `Delivery_Stores` (6 distinct MD5s/yr), `DEMOS.CSV` (same panelist pool per yr) | 31 near-identical copies per year | content-hash canonicalisation; one row set per *content*, one mapping table from file → canonical |
-| **Schema drift mid-series** | PANEL: tab → whitespace → comma; `MINUTE` appears at yr 8; `OUTLET` codes DR/GR/MA → DK/GK/MK/(KK at yr 8 only) | three parsers, three shapes, no unified read path | one unified schema with explicit `channel_code` and a documented `source_format` |
-| **Slowly-changing dimensions** | store → chain, item → product attributes, week → date | n/a | effective-dated rows, resolved as-of by the joining fact's week |
+| **Duplication** | `Delivery_Stores` and `DEMOS.CSV` have repeated content across source paths | many near-identical copies | content-hash canonicalisation and provenance back to source paths |
+| **Schema drift mid-series** | PANEL: tab → whitespace → comma; `MINUTE` appears at yr 8; `OUTLET` codes DR/GR/MA → DK/GK/MK/(KK at yr 8 only) | several dialects, one Bronze-normalized schema | one unified schema with explicit `channel_code` and a documented `source_format` |
+| **Changing relationships** | annual store observations → chain, item → product attributes, week → date | keys and time semantics are not yet consumer-ready | explicit year-scoped keys and relationships; use as-of semantics only where the source supports them |
 
 A fourth, smaller one: **grain is implicit**. `iri_sales` is one row per
 (store, week, vendor, item) weekly aggregate. Nothing in Bronze says so. Silver states
@@ -131,25 +156,25 @@ mistake available in a lake this size.
 
 The principle already recorded in `ARCHITECTURE.md` holds and is restated here as the
 rule Silver is measured against: **derive what is derivable, store what is captured.**
-`source_year` stays out of the rows (a pure function of `week`, §Partitioning of
-`ARCHITECTURE.md`). `calendar_start_date` *is* a Silver column, because it needs a join
-to another table — the join is the justification, not the derivability.
+The calendar dates are exposed in Silver because they come from joining the captured Bronze
+week dimension to sales; the agreed calendar view itself contains only the requested week
+and date fields.
 
 ## 2. Layout
 
 ```
 data/lake/silver/
-├── calendar/          # silver_week_dimension
-├── store/             # silver_store, silver_chain, silver_market, store<->chain map
+├── calendar/          # silver_week_dimension_v
+├── store/             # store, chain, market, county, and validated crosswalk views
 ├── product/           # silver_product, silver_product_attribute
 └── household/         # silver_panel_trip, silver_household, silver_panelist_static
 ```
 
 - Hive partitioning, one directory per domain, and only where the partition key is
-  *truly* non-derivable and high-cardinality in a useful way. `silver_week_dimension`
-  carries `year` as a physical column rather than a partition: it is 626 rows.
-  `silver_store` carries `valid_from_year`/`valid_to_year` as columns, not partitions —
-  the set of stores valid in year *n* is a predicate, not a directory tree.
+  *truly* non-derivable and high-cardinality in a useful way. The 626-row
+  `silver_week_dimension_v` needs no year partition. Annual store observations are
+  year-scoped; do not imply continuity with `valid_from_year`/`valid_to_year` unless a
+  source crosswalk establishes it.
 - Physical partition columns appear in the Parquet **only** where they are also
   partitioning keys, matching the Bronze convention (`ARCHITECTURE.md`,
   "The Parquet files do NOT contain partition columns"). Divergence from Bronze here is
@@ -176,10 +201,12 @@ Bronze inputs get their own manifest records with `output_schema_version`, and t
 existing skip/idempotence machinery applies unchanged. That is the reason to prefer
 views — promotion costs a file, not a rewrite.
 
-**No Silver fact table is planned for the 2.7 B sales rows yet.** The tempting view —
-"sales + calendar date + product + store, joined" — is four joins over a billion-row
-scan, and every consumer will want a different projection of it. Gold marts are the right
-home for that; Silver's job is to make the *dimensions* correct and joinable.
+**No row-level Silver copy of the 2.7 B sales fact is planned.** The requested
+`silver_product_week_v` is an explicit exception: it is a reduced product-week aggregate,
+not an enriched copy of every sales row. Its view definition is in
+`sql/silver_product_week.sql`. Its measured full evaluation took 66.39 seconds, so it
+qualifies for materialization under §3. `scripts/materialize_product_week.py` writes the
+aggregate and key crosswalk as Parquet and reports their write times and sizes.
 
 ## 4. Conventions
 
@@ -189,8 +216,9 @@ home for that; Silver's job is to make the *dimensions* correct and joinable.
 - **Sentinels.** The Gate 5d sweep (`iri_key = 0`, negative dollars, unknown feature) is
   the model. Silver adds its own per-table sentinel list and checks it in a gate, not in
   the view — a view that silently filters bad rows hides the count.
-- **NULLs mean "unknown", never "zero".** A missing week translation is `NULL` plus a
-  `date_source` label (§5.1), not a fabricated date and not `1970-01-01`.
+- **NULLs mean "unknown", never "zero".** Do not fabricate values to make a lookup join
+  appear complete. The current calendar source covers all weeks, so the initial calendar
+  view needs neither null dates nor a `date_source` label.
 - **Schema versioning.** `silver_schema_version` per table, recorded in whatever manifest
   record the materialized table produces, following `output_schema_version`'s pattern.
 - **Provenance.** Every Silver table carries the Bronze source(s) it was derived from —
@@ -201,7 +229,7 @@ home for that; Silver's job is to make the *dimensions* correct and joinable.
 
 ## 5. Domains
 
-### 5.1 Calendar — `silver_week_dimension`
+### 5.1 Calendar — `silver_week_dimension_v`
 
 **Bronze prerequisite — built.** Ingest the IRI Week Translation `.xls`
 files with [`calamine`]: `demos trips external/IRI week
@@ -212,100 +240,89 @@ as skipped. Output: `bronze/iri_week_dimension/`, one flat Parquet
 file, keyed by `week`. See [`excel_to_bronze.md`](excel_to_bronze.md)
 §3.
 
-> **The year 6–7 gap does not exist.** §9.1 asked whether the missing
-> per-year translations for years 6 and 7 left a hole in the week
-> mapping. Measured over the ingested table: no hole. All twelve years
-> are present, years 6 and 12 have 53 weeks and the rest have 52, and
-> every week spans exactly 6 days (Monday–Sunday). The gap policy below
-> therefore reduces to a single tier — `date_source` is uniformly
-> `'captured'` and there is nothing to interpolate. The policy is kept
-> because it is the right shape for a table whose coverage is incomplete
-> *in general*, but it does not bind for this corpus.
+> **The year 6–7 gap does not exist.** The authoritative Bronze workbook covers all
+> 626 weeks, including years 6 and 7. Years 6 and 12 have 53 weeks, the rest have 52, and
+> each week spans Monday–Sunday. All dates in the initial view are captured; interpolation
+> and a `date_source` column are not needed for this corpus.
 
 **Grain.** One row per IRI `WEEK` (1114–1739, contiguous and non-overlapping; years 6 and
 12 have 53 weeks). This is the smallest and highest-leverage table in the lake.
 
-**Schema.**
+**Agreed view interface.** `silver_week_dimension_v` has one row per IRI week, keyed by
+`week`. Its required columns are:
 
-| column | type | notes |
+| column | type | Bronze source |
 |---|---|---|
-| `week` | `UInt16` | IRI week number; natural key |
-| `source_year` | `UInt8` | derivable from `week`; see below |
-| `calendar_start_date` | `Date32` | NULL when not captured — see the gap policy |
-| `calendar_end_date` | `Date32` | the IRI academic week end, as captured |
-| `date_source` | dictionary `UInt8` | `captured` / `interpolated` / `missing` |
-| `source_file` | `Utf8` | provenance: which translation `.xls` this came from |
+| `week` | `UInt16` | `iri_week` |
+| `calendar_start_date` | `Date32` | `week_start` |
+| `calendar_end_date` | `Date32` | `week_end` |
 
-**`source_year` stays a view expression, not a column.** `fixed_width::week_to_year` is a
-`match` over hard-coded, stable ranges; storing it would be redundant data that can
-disagree with `week` in the same row — the exact failure mode `ARCHITECTURE.md` already
-rejected for Bronze. The column is exposed in the view and computed, never persisted.
+The initial public interface is limited to these requested calendar fields. Provenance
+remains available through Bronze and its manifest; no fabricated dates or interpolation
+are needed. The existing measured checks still apply: 626 distinct contiguous weeks,
+1114–1739, each spanning six days.
 
-**The year 6–7 gap.** Both translation files are missing for those years (documented in
-`docs/data_layout.md` §2.3), and `demos trips external/IRI week translation.xls` may cover
-part of it — this needs to be verified by the calamine probe before the policy is fixed.
-Proposed policy, in preference order:
-
-1. **Captured** where a translation file provides the week.
-2. **Interpolated** — only if an adjacent year's translation establishes the anchor dates
-   and the 53-week year 6 boundary is provable — written to *separate rows or a separate
-   table*, flagged `interpolated`, never merged silently into `captured`.
-3. Otherwise `calendar_start_date IS NULL`, `date_source = 'missing'`.
-
-A consumer filtering `WHERE date_source = 'captured'` must get the same answer whether or
-not interpolation has been done. That is the whole point of the label.
-
-**Joining to sales.** `iri_sales.week = silver_week_dimension.week`. On 2.7 B rows this is
+**Joining to sales.** `iri_sales.week = silver_week_dimension_v.week`. On 2.7 B rows this is
 a broadcast hash join on a 626-row build side — effectively free, which is the argument for
 doing this in Silver rather than as a materialized sales rewrite.
 
-### 5.2 Store & chain — `silver_store`, `silver_chain`, `silver_market`
+### 5.2 Store, chain & market — Silver views
 
-The heaviest domain: duplication, masking, and SCD all at once.
+The heaviest domain: duplicated roster sources, masked chain labels, and market crosswalks.
 
-**Bronze prerequisites.**
+**Bronze inputs.** The store roster, masked-chain cross-reference, manual-store reference,
+and FIPS market lookup are Bronze inputs for this domain. The full-corpus rerun is complete
+and Gates 5 and 6 pass; inspect actual coverage and duplicate keys before defining these
+views.
 
-1. `Delivery_Stores` — present in every (year, category); **6 distinct MD5s per year**
-   across 31 categories. Ingest all copies, then canonicalise by content hash. The
-   expected shape is `bronze/delivery_stores/content=<md5>/year=<N>.parquet` plus a
-   mapping from each of the 31 (year, category) paths to its canonical content set.
-2. `masked_chain_xref*.csv` — chain cross-reference; note three overlapping windows
-   (`1_5`, `1_7`, `1_12` reconstruction) plus a top-level duplicate. Ingest the widest
-   (`1_12`) and record that the narrower ones are subsets.
-3. `fips by IRI market.xls` — FIPS county → IRI market. **Built**:
-   `bronze/iri_fips_market/`, 3 141 rows, one per county, 65 IRI markets
-   across 9 regions. See [`excel_to_bronze.md`](excel_to_bronze.md) §4.
-4. `panel complete store list with chains.xlsx` — optional enrichment, decide later.
+**Annual store identity.** `silver_store` represents one roster observation in one source
+year and assigns it an internal `store_id`. The candidate alternate key is
+(`source_year`, `iri_key`), which must be checked for uniqueness against the completed
+roster before it is relied on. Sales resolve to that annual record using the exact year and
+`iri_key`; do not use `iri_key` alone across years or an as-of join to carry a store ID
+forward.
 
-**Grain.** `silver_store`: one row per (`iri_key`, `source_year`) — a store's attributes
-as of that year. `Chain87` in year 1 and year 8 are two rows, not one row and not a
-conflict. `silver_chain`: one row per (`chain_id`, `source_year`).
+Masked chain names are chain-level identifiers, not store identifiers. Build a separate
+year-aware store-to-chain relationship from the roster and chain cross-reference. A shared
+masked chain name can link a store to a chain across years, but does not establish that two
+annual store observations are the same physical outlet. Any physical-store continuity would
+require a separate, verified store crosswalk.
 
-**Keys.** `iri_key` (`UInt32`, the sales fact's store id) is the join key. The crosswalk to
-sales is `iri_sales.iri_key = silver_store.iri_key` **and** `year`, because store
-attributes are year-scoped and sales carries year only as a Hive partition column.
+**Market lookup shape.** The FIPS Bronze table is county-grained (one row per `fips_key`)
+and maps counties to `iri_market_number`; it is not a store table. Model the layers
+separately:
 
-**Why effective-dating rather than last-write-wins.** Chain assignment genuinely changes
-over 12 years. A current-state `silver_store` would make 1998 beer sales join to a 2018
-chain name — silently, and plausibly enough that nobody would notice in a chart. The
-as-of join must be forced by the schema:
+- `silver_market_v`: one row per IRI market number, with its canonical market and region
+  attributes. Preserve market number `0` as the real source value.
+- `silver_fips_market_v`: one row per FIPS county, linked to its IRI market. Many counties
+  may map to one market.
+- `silver_market_name_xref_v`: a validated crosswalk from the store roster's market label
+  to `iri_market_number`, retaining the source label, year scope if needed, and match
+  status/provenance. Do not assume that similarly named fields match one-to-one.
+- `silver_store_market_v`: links an annual `store_id` to a market through that crosswalk.
+  Keep unresolved and ambiguous labels visible rather than silently assigning a market.
+
+Thus market codes identify markets, not stores: do not match a market code directly to a
+store identifier. Confirm the crosswalk's uniqueness and resulting join cardinality before
+using it in sales analysis.
+
+**Sales join.** Join sales to the annual store record on `year` plus `iri_key`, then obtain
+chain and market relationships from that year-scoped `store_id`:
 
 ```sql
--- sketch: as-of join, not equality join
-SELECT s.iri_key, f.dollars_cents, c.chain_name
-FROM   silver_sales_view f
-JOIN   silver_store s
-  ON   s.iri_key = f.iri_key
- AND   s.source_year <= f.source_year
- AND   (s.valid_to_year IS NULL OR s.valid_to_year > f.source_year)
-LEFT JOIN silver_chain c USING (chain_id, source_year);
+SELECT f.iri_key, f.year, s.store_id, sc.chain_id, sm.iri_market_number
+FROM   iri_sales f
+JOIN   silver_store_v s
+  ON   s.source_year = f.year AND s.iri_key = f.iri_key
+LEFT JOIN silver_store_chain_v sc
+  ON   sc.store_id = s.store_id AND sc.source_year = f.year
+LEFT JOIN silver_store_market_v sm
+  ON   sm.store_id = s.store_id AND sm.source_year = f.year;
 ```
 
-**Dedup rule.** Content hash decides canonical identity; the *file* is not identity. Two
-`Delivery_Stores` files with the same MD5 in different category directories are one
-content set, and the mapping table records all 31 provenance paths. Any future divergence
-between two copies that currently share an MD5 becomes a real finding, not a silent
-overwrite.
+**Dedup rule.** Content hash decides canonical identity; the *file* is not identity. Keep
+Bronze provenance for each canonical roster content set, and treat any divergence between
+previously identical copies as a data finding rather than a silent overwrite.
 
 **Open.** `OU` codes (DR/GR/MA → DK/GK/MK, KK at yr 8 only) map to channel; the mapping
 belongs in `silver_store.channel_code` as a dictionary column with an explicit
@@ -332,11 +349,12 @@ category, derived from that matrix, not from the filename.
 years; the union is upserted by UPC with `first_seen_year`/`last_seen_year`, so a UPC
 absent in year *n* but present in *n+1* is a gap, not a delete.
 
-**Keys.** `silver_product.upc` (or `item`/`vend` split as the stub provides) joins to
-`iri_sales.vend`/`iri_sales.item`. The join is **not** on UPC — it is on the
-4-tuple `(SY, GE, VEND, ITEM)`, and the `VEND`/`ITEM` pair is an IRI item code, not a UPC.
-Verified below (§9.2); the two ways to get it wrong are recorded in
-*How stubs join to sales* below.
+**Keys.** Sales resolve through the full 4-tuple `(SY, GE, VEND, ITEM)`; the
+`VEND`/`ITEM` pair is an IRI item code, not a UPC. The separate
+`silver_product_key_xref_v` preserves that tuple alongside UPC. Full Bronze profiling found
+324,745 complete distinct tuples and UPCs with a one-to-one mapping in both directions
+across editions. The 790 rows whose key and UPC are all null are not product mappings.
+The materialized crosswalk is at `data/lake/silver/product_key_xref/`.
 
 ### How stubs join to sales
 
@@ -394,6 +412,17 @@ literal string `MISSING`, not a null — IRI wrote it deliberately. A view
 that counts known attributes with `IS NOT NULL` will overcount by every
 one. See [`excel_to_bronze.md`](excel_to_bronze.md) §8.
 
+**Product-week sales building blocks.** `silver_product_key_xref_v` retains the full IRI
+item tuple next to UPC as a reversible mapping. Its profile validates that repeated rows in
+overlapping stub editions agree before canonicalizing the mapping. `silver_product_week_v`
+then groups all sales by UPC and IRI week, summing units and integer cents across stores,
+categories, and channels. The full evaluation and manifest coverage check are scripted in
+`sql/silver_product_week.sql`; the measured evaluation took 66.39 seconds. Because the view
+repeatedly scans the large sales Bronze table, `scripts/materialize_product_week.py`
+persists both outputs: `data/lake/silver/product_week/` (28,314,411 rows,
+350,825,041 bytes) and the key crosswalk (324,745 rows, 3,213,051 bytes). Revenue and
+quantity sums are stored as exact `BIGINT` values, not floating-point values.
+
 **`prod_attr`** (years 9–11 only) is a per-UPC attribute text table, not a stub. Treat as
 optional enrichment with an explicit year range; its absence in years 1–8 and 12 must
 survive into Silver as a labelled gap, not as a missing row that looks like a null value.
@@ -437,15 +466,20 @@ machine. Worth an explicit decision before this domain is built.
 
 ## 6. Grain & key inventory
 
-The one table worth keeping accurate. Everything else in this document is elaboration of
-these five rows.
+This inventory is the contract to keep accurate as the design develops.
 
 | Silver table | Grain (one row per…) | Natural key | Joins to `iri_sales` on | Blocking Bronze prerequisite |
 |---|---|---|---|---|
-| `silver_week_dimension` | IRI week | `week` | `week` | **done** — `iri_week_dimension`, 626 weeks |
-| `silver_store` | store per year | (`iri_key`, `source_year`) | `iri_key` + year | `Delivery_Stores` ingest + MD5 canonicalisation |
-| `silver_chain` | chain per year | (`chain_id`, `source_year`) | via `silver_store` | `masked_chain_xref` ingest |
+| `silver_week_dimension_v` | IRI week | `week` | `week` | **Bronze input present** — `iri_week_dimension`, 626 weeks |
+| `silver_store_v` | annual store observation | internal `store_id`; candidate alternate key (`iri_key`, `source_year`) pending uniqueness check | `iri_key` + year | Completed `iri_delivery_stores` Bronze run |
+| `silver_store_chain_v` | annual store-to-chain assignment | (`store_id`, `source_year`, `chain_id`) pending source validation | via annual `store_id` | `iri_chain_xref` plus roster |
+| `silver_market_v` | IRI market | `iri_market_number` | via store-market mapping | `iri_fips_market` |
+| `silver_fips_market_v` | county | `fips_key` | none directly | `iri_fips_market` |
+| `silver_market_name_xref_v` | source market label mapping | source label + scope, to validate | via annual store `store_id` | roster labels plus FIPS market table |
+| `silver_store_market_v` | annual store-to-market assignment | (`store_id`, `source_year`) if unique, to validate | via annual `store_id` | validated market-name crosswalk |
 | `silver_product` | UPC per year | (`upc`, `source_year`) | `(sy, ge, vend, item)`, year-scoped to the stub edition (**verified**) | **done** — 124 stubs, 634 824 rows |
+| `silver_product_key_xref_v` | IRI key tuple ↔ UPC | (`sy`, `ge`, `vend`, `item`) and `upc` | product identity mapping | **Materialized** — 324,745 complete one-to-one mappings |
+| `silver_product_week_v` | UPC × IRI week, summed across stores/categories/channels | (`upc`, `week`) | product-week aggregate | **Materialized** — 2,700,651,386 sales rows covered; 66.39-second view evaluation |
 | `silver_panel_trip` | household purchase | (`panid`, `week`, `iri_key`, `upc`) | **none** (different grain) | PANEL 3-format ingest + trips CSV |
 | `silver_household` | panelist | `panid` | **none** | `DEMOS.CSV` ingest + dedup |
 
@@ -454,43 +488,43 @@ these five rows.
 Not written yet, but the checks follow Gate 5's shape (`sql/` + `scripts/run_sql.py`, each
 column ending `_ok`, non-zero exit). Candidates, in rough order of value:
 
-- **Coverage.** Every `week` in `iri_sales` has exactly one row in
-  `silver_week_dimension`; the count of weeks with `date_source != 'captured'` is reported
-  and *expected* for years 6–7 rather than treated as failure.
-- **Key integrity.** `count(DISTINCT (iri_key, source_year)) = count(*)` in
-  `silver_store`; no duplicate UPC keys in `silver_product`.
-- **Dedup.** The number of distinct content hashes per year for `Delivery_Stores` matches
-  the documented 6 — a change there is a corpus finding, not noise.
-- **SCD sanity.** Every `silver_store` row's `valid_to_year` is `NULL` or greater than
-  `source_year`; no overlapping validity windows for a given `iri_key`.
-- **Join cost.** The as-of join in §5.2 is measured before it is relied on — if it does not
-  broadcast cheaply, §3 promotion criterion 3 applies to the *joined* table, not to the
-  sales scan.
-- **Null policy.** `calendar_start_date IS NULL` count per year is pinned to a known
-  number, so an accidental regression in the Excel parser shows up as a delta.
+- **Calendar coverage.** Every sales `week` has exactly one row in
+  `silver_week_dimension_v`; its 626 keys are unique and contiguous, and dates are non-null.
+- **Store-key integrity.** Verify the annual roster key (`source_year`, `iri_key`) is
+  unique before assigning `store_id`; if not, find and document the missing discriminator.
+- **Join cardinality.** Check sales-to-store, store-to-chain, and store-to-market joins for
+  unmatched keys and fan-out. Market-name mappings must be unambiguous before assignment.
+- **Chain semantics.** Test chain links by year and preserve source labels/provenance; do
+  not treat a shared chain as proof of the same physical store.
+- **Market integrity.** Each FIPS key maps once; market numbers are unique in
+  `silver_market_v`; report unmatched/ambiguous store market labels, including rather
+  than filtering out market number `0`.
+- **Product-week integrity.** The key↔UPC crosswalk is one-to-one, and the product-week
+  output accounts for the latest successful sales rows in the manifest without fan-out.
+  Record full-evaluation time and materialized Parquet time/size separately.
 
 ## 8. Sequencing
 
 **Step 1 is done.** See [`excel_to_bronze.md`](excel_to_bronze.md) for
 what was built, measured, and tested.
 
-Prerequisites before any Silver view is worth writing:
-
-1. ~~**Excel → Bronze** (calamine): week translation first. It is the smallest source, has
-   the fewest consumers, and unblocks the highest-value join. Stubs second, fips third.~~
-   **Done** — week translation (626 weeks), FIPS market (3 141 counties) and the stubs
-   (124 workbooks, 634 824 rows) are all in the lake; 203 tests pass, clippy clean.
-2. **`Delivery_Stores` → Bronze with MD5 canonicalisation** — needed for any store-keyed
-   analysis and for the SCD design to be testable.
-3. Then the §5.1 and §5.2 views, then a Silver gate.
-4. Product and household only after that, and household last (§5.4).
+1. **Bronze ingestion and reconciliation.** Complete. Gates 5 and 6 pass against the
+   current lake.
+2. Build and gate `silver_week_dimension_v` first: one row per week with the three agreed
+   calendar columns.
+3. Product-key crosswalk profiling, UPC-week evaluation, and Parquet materialization are
+   complete. The materializer is reproducible with `make materialize-product-week`; use
+   `--overwrite` when intentionally rebuilding existing outputs.
+4. Profile store roster key uniqueness and market-label coverage/cardinality before
+   defining store, chain, and market views. Defer household views until its grain and
+   privacy handling are agreed.
 
 ## 9. Open questions
 
 1. **Years 6–7 week translation.** ~~Verify against `demos trips external/` whether the gap is
    fully or partly covered before fixing the interpolation policy (§5.1).~~ **Resolved:
    fully covered.** The authoritative workbook spans all 626 weeks with no gap, so no
-   interpolation policy is needed and `date_source` is uniformly `'captured'`. See
+   interpolation policy or `date_source` column is needed. See
    [`excel_to_bronze.md`](excel_to_bronze.md) §3.
 2. ~~**Stub → sales key correspondence.** Does `iri_sales.vend`/`item` join to a UPC in the
    stubs?~~ **Resolved.** The key is the 4-tuple `(SY, GE, VEND, ITEM)`, **not** a UPC, and
@@ -504,6 +538,10 @@ Prerequisites before any Silver view is worth writing:
    for years 1–5, or does it override `1_5`/`1_7` where they disagree?
 5. **Panelist data handling.** Confirm the access/segregation policy for
    `silver_household` before any ingestion work starts (§5.4).
-6. **Does anything actually need Silver at all yet?** The honest possibility is that the
-   calendar join alone is the entire near-term requirement, in which case §5.3–§5.4 are
-   parking, not a roadmap.
+6. **Physical store continuity.** The agreed `store_id` identifies an annual store
+   observation. A verified source that links the same physical outlet across years is still
+   needed before claiming cross-year store continuity; masked chain names provide chain,
+   not outlet, identity.
+7. **Store-market name matching.** Validate whether roster `market_name` values map
+   unambiguously to the FIPS table's IRI market names/codes after the Bronze rerun; keep
+   unmatched or ambiguous rows unresolved until then.

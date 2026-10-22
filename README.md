@@ -4,6 +4,8 @@ A high-throughput Rust CLI that discovers IRI store-level weekly sales files,
 parses their invariant fixed-width records, and writes typed Apache Parquet
 files into a Hive-style partitioned lakehouse.
 
+Silver orchestration usage and current implementation limitations are documented in [docs/silver_usage.md](docs/silver_usage.md).
+
 ```
 data/raw/    ──►   iri-lake ingest   ──►   data/lake/bronze/iri_sales/
                                                 year=12/category=toothpa/channel=drug/

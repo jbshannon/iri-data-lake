@@ -25,6 +25,7 @@ TMP_MAX_AGE_HOURS ?= 24
 #   make ingest-other OTHER_FLAGS="--only panel --explain-skips"
 SALES_FLAGS ?=
 OTHER_FLAGS ?=
+SILVER_FLAGS ?=
 
 # ---- Targets ---------------------------------------------------------------
 
@@ -52,6 +53,11 @@ help:
 	@echo "  make gate5          Reconcile $(LAKE) against its manifest (DuckDB)"
 	@echo "  make gate6          Reconcile the non-sales tables + cross-table joins (DuckDB)"
 	@echo "  make sql SQL=...    Run an arbitrary file from sql/ against $(LAKE)"
+	@echo "  make materialize-product-week  Legacy product-week writer (not a managed release)"
+	@echo "  make silver-plan/silver-build  Plan/stage a managed Silver release (see docs/silver_usage.md)"
+	@echo "  make silver-publish STAGING=...  Validate staging and explicitly switch current"
+	@echo "  make gate7          Reconstruct a pinned release and replay its archived checks"
+	@echo "  make silver-test    Run synthetic analytics and release integration tests"
 
 .PHONY: fmt
 fmt:
@@ -151,12 +157,46 @@ sql:
 gate5:
 	uv run python scripts/run_sql.py sql/gate5_reconciliation.sql --lake $(LAKE)
 
+# Materialize the profiled Silver UPC-week aggregate and its reversible
+# product-key crosswalk. Requires complete Bronze and passing Gates 5/6.
+.PHONY: materialize-product-week
+materialize-product-week:
+	uv run python scripts/materialize_product_week.py --lake $(LAKE) $(SILVER_FLAGS)
+
 # Gate 6: reconcile the ten non-sales tables against the manifest and
 # against each other. Needs a lake that has had `make ingest-other` run
 # against it; gate 6.2 and 6.4 additionally need `iri_sales` present.
 .PHONY: gate6
 gate6:
 	uv run python scripts/run_sql.py sql/gate6_non_sales.sql --lake $(LAKE)
+
+# ---- Silver release orchestration -----------------------------------------
+
+.PHONY: silver-plan silver-build silver-publish silver-validate silver-rollback silver-test gate7
+SILVER_ROOT ?= $(OUT)/silver
+silver-plan:
+	uv run python -m scripts.silver plan --lake "$(LAKE)" $(foreach d,$(SILVER_DATASETS),--dataset $(d)) $(SILVER_FLAGS)
+
+# No implicit --quiescent or --publish: operators must explicitly acknowledge both.
+silver-build:
+	uv run python -m scripts.silver build --lake "$(LAKE)" --silver-root "$(SILVER_ROOT)" $(foreach d,$(SILVER_DATASETS),--dataset $(d)) $(SILVER_FLAGS)
+
+silver-publish:
+	@test -n "$(STAGING)" || (echo 'set STAGING to a reviewed staging directory' >&2; exit 2)
+	uv run python -m scripts.silver publish --silver-root "$(SILVER_ROOT)" --staging "$(STAGING)"
+
+silver-validate:
+	uv run python -m scripts.silver validate --silver-root "$(SILVER_ROOT)" $(if $(RELEASE_ID),--release-id "$(RELEASE_ID)")
+
+# Gate 7 replays the pinned release's complete archived assertion set, not current code.
+gate7: silver-validate
+
+silver-rollback:
+	@test -n "$(RELEASE_ID)" -a -n "$(REASON)" || (echo 'set RELEASE_ID and REASON' >&2; exit 2)
+	uv run python -m scripts.silver rollback --silver-root "$(SILVER_ROOT)" --release-id "$(RELEASE_ID)" --reason "$(REASON)"
+
+silver-test:
+	uv run python -m unittest discover -s tests/analytics -v
 
 # ---- Full-corpus run -------------------------------------------------------
 

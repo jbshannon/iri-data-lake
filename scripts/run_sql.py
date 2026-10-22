@@ -83,8 +83,12 @@ def main() -> int:
     ap.add_argument("sql_file", type=Path)
     ap.add_argument("--lake", default=os.environ.get("LAKE", "data/lake"),
                     help="lake output root (default: $LAKE or data/lake)")
+    ap.add_argument("--silver-root", type=Path, help="bootstrap one pinned managed release before executing SQL")
+    ap.add_argument("--release-id", help="pin an explicit release instead of current")
+    ap.add_argument("--restricted", action="store_true", help="explicitly allow a restricted release bootstrap")
     ap.add_argument("--var", action="append", default=[],
                     help="extra substitution NAME=value (repeatable)")
+    ap.add_argument("--expect", action="append", default=[], help="required assertion column (repeatable)")
     ap.add_argument("--threads", type=int, default=0,
                     help="DuckDB worker threads (0 = leave default)")
     args = ap.parse_args()
@@ -105,11 +109,22 @@ def main() -> int:
         sys.exit(f"unsubstituted variable in SQL: {leftover}")
 
     con = duckdb.connect()
+    if args.release_id and args.silver_root is None:
+        ap.error("--release-id requires --silver-root")
+    if args.silver_root is not None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from scripts.silver import bootstrap
+        bootstrap.load(con, args.silver_root, args.release_id, allow_restricted=args.restricted)
     if args.threads:
         con.execute(f"SET threads = {int(args.threads)}")
 
     failures: list[str] = []
-    for i, stmt in enumerate(split_statements(text), start=1):
+    seen_assertions: set[str] = set()
+    statements = split_statements(text)
+    if not statements:
+        print("GATE FAILED: SQL file contains no statements.", file=sys.stderr)
+        return 1
+    for i, stmt in enumerate(statements, start=1):
         label = " ".join(stmt.split())[:70]
         try:
             started = time.time()
@@ -132,19 +147,26 @@ def main() -> int:
         for r in rows:
             print("  " + "  ".join(str(v).ljust(widths[j]) for j, v in enumerate(r)))
 
-        for j, col in enumerate(cols):
-            if col.endswith("_ok"):
-                for r in rows:
-                    if r[j] is False:
-                        failures.append(f"[{i}] {col} is false")
+        expected_cols = [j for j, col in enumerate(cols) if col.endswith("_ok")]
+        seen_assertions.update(cols[j] for j in expected_cols)
+        for j in expected_cols:
+            if not rows:
+                failures.append(f"[{i}] {cols[j]} returned zero rows")
+            for row_index, row in enumerate(rows, start=1):
+                if row[j] is not True:
+                    failures.append(f"[{i}] {cols[j]} row {row_index} was {row[j]!r}, expected TRUE")
 
+    if not seen_assertions:
+        failures.append("SQL script returned no assertion columns ending in _ok")
+    for missing in set(args.expect) - seen_assertions:
+        failures.append(f"missing expected assertion: {missing}")
     print()
     if failures:
         print(f"GATE FAILED ({len(failures)}):")
         for f in failures:
             print(f"  - {f}")
         return 1
-    print("GATE PASSED: every `*_ok` column was true.")
+    print("GATE PASSED: every assertion column ending in `_ok` returned TRUE.")
     return 0
 
 
