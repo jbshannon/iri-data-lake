@@ -23,6 +23,8 @@ def main(argv=None):
         if name == "build":
             command.add_argument("--silver-root", type=Path, required=True)
             command.add_argument("--publish", action="store_true")
+            command.add_argument("--skip-validation", action="store_true",
+                                 help="skip semantic and replay gates; output is unvalidated and never publishable")
             command.add_argument("--quiescent", action="store_true", help="acknowledge Bronze writers are stopped during capture")
             command.add_argument("--household", action="store_true")
             command.add_argument("--restricted-root", type=Path)
@@ -52,7 +54,7 @@ def main(argv=None):
                                  household=args.household, restricted_root=args.restricted_root, approval=args.approval,
                                  reference_root=args.reference_root, scope=args.scope, readiness=args.readiness,
                                  quiescent=args.quiescent, threads=args.threads, memory_limit=args.memory_limit,
-                                 temp_directory=args.temp_directory)
+                                 temp_directory=args.temp_directory, skip_validation=args.skip_validation)
         elif args.command == "publish":
             result = build.publish_staged(args.silver_root, args.staging)
         elif args.command == "validate":

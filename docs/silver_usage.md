@@ -47,7 +47,26 @@ calendar. Omitted domains are not fabricated. Unsupported/malformed selected dat
 fails closed rather than being silently dropped.
 
 Build options include `--threads N`, `--memory-limit 4GB`, `--temp-directory PATH`,
-and `--reference-root PATH`. The supported reviewed reference is
+and `--reference-root PATH`. The opt-in `--skip-validation` mode still performs input
+capture, relation registration, aggregation, and materialization; it skips both semantic
+gates and fresh replay validation. Its result is explicitly `unvalidated`, with
+`validation_status: "skipped"`, checksum metadata for produced files, no passing gate
+results, and no replay bundle. It is written under `.staging/unvalidated/`, is not a
+managed/publishable release, and is rejected by publication, release loading, validation,
+bootstrap, and rollback. `--skip-validation --publish` is rejected. Never promote the
+artifact by editing its descriptor: discard it and rerun a normal validated build when
+gates are available. This mode is diagnostic/materialization-only, not a way to bypass
+release acceptance.
+
+Do not resume an interrupted build or assume its staging tree is complete. Once the
+process is confirmed stopped, inspect the specific path and remove only that abandoned
+staging directory (for example, `rm -rf /tmp/iri-silver/.staging/unvalidated/PATH`);
+keep any current release untouched. Retry only after confirming Bronze writers are
+stopped and input state is suitable. An incomplete older `.staging/` directory is not a
+release and should likewise be removed only after confirming its owning process has
+terminated.
+
+The supported reviewed reference is
 `stub_categories.csv`, with columns `edition,source_workbook,category`. Conflicting
 basename/full-path mappings fail; absent mappings remain unresolved. Reference bytes
 are captured and checksummed. Unknown files, nested reference files and reference symlinks are rejected.

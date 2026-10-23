@@ -101,6 +101,41 @@ class ReleaseIntegrationTests(unittest.TestCase):
         self.assertNotIn('"dataset":"panel"', metadata)
         self.assertFalse(any("iri_panel" in str(p) for p in release.rglob("*")))
 
+    def test_skip_validation_is_distinct_unpublishable_and_integrity_checked(self):
+        with (patch.object(build.validation, "validate", side_effect=AssertionError("semantic validation ran")),
+              patch.object(build, "_replay", side_effect=AssertionError("replay validation ran"))):
+            staged = self.run_build(skip_validation=True)
+        self.assertEqual(staged["state"], "unvalidated")
+        self.assertEqual(staged["validation_status"], "skipped")
+        stage = Path(staged["staging"])
+        self.assertIn("unvalidated", stage.parts)
+        self.assertEqual(stage.parent.name, "unvalidated")
+        descriptor = json.loads((stage / "release.json").read_text())
+        self.assertEqual(descriptor["state"], "unvalidated")
+        self.assertEqual(descriptor["validation_status"], "skipped")
+        self.assertNotIn("gate_results", descriptor)
+        self.assertNotIn("bundle_path", descriptor)
+        self.assertEqual(json.loads((stage / "validation.json").read_text()), {"status": "skipped"})
+        for info in descriptor["outputs"].values():
+            self.assertEqual(hashlib.sha256((stage / info["path"]).read_bytes()).hexdigest(), info["sha256"])
+        with self.assertRaisesRegex(ValueError, "unvalidated"):
+            build.publish_staged(self.silver, stage)
+        with self.assertRaisesRegex(ValueError, "unvalidated"):
+            from scripts.silver.releases import publish_release
+            publish_release(self.silver, stage, descriptor)
+        self.assertFalse((self.silver / "current.json").exists())
+
+    def test_skip_validation_publication_is_rejected_and_cli_option_is_exposed(self):
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            self.run_build(skip_validation=True, publish=True)
+        from scripts.silver.__main__ import main
+        with patch.object(build, "build", return_value={"state": "unvalidated"}) as mocked:
+            self.assertEqual(main(["build", "--lake", str(self.lake), "--silver-root", str(self.silver),
+                                   "--quiescent", "--skip-validation"]), 0)
+        self.assertTrue(mocked.call_args.kwargs["skip_validation"])
+        self.assertEqual(main(["build", "--lake", str(self.lake), "--silver-root", str(self.silver),
+                               "--quiescent", "--skip-validation", "--publish"]), 1)
+
     def test_noop_skips_registration_and_ignores_unrelated_sensitive_append(self):
         published = self.run_build(publish=True)
         manifest = self.lake / "metadata" / "manifest.jsonl"

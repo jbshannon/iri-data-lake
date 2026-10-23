@@ -161,6 +161,8 @@ def publish_staged(root: Path, staging: Path):
         raise ValueError("publish requires an existing managed staging release")
     with exclusive_lock(root):
         descriptor = json.loads((staging / "release.json").read_text())
+        if descriptor.get("state") == "unvalidated" or descriptor.get("validation_status") == "skipped":
+            raise ValueError("unvalidated staging artifacts cannot be published")
         _replay(root, staging, descriptor)
         # Verify all artifact checksums as well as the bundle; no pointer moves on failure.
         return publish_release(root, staging, descriptor)
@@ -180,7 +182,9 @@ def rollback(root: Path, release_id, *, reason):
 def build(lake: Path, silver_root: Path, *, datasets=None, publish=False, household=False,
           restricted_root: Path | None = None, approval: str | None = None,
           reference_root=None, scope="partial", readiness=None, quiescent=False,
-          threads=None, memory_limit=None, temp_directory=None):
+          threads=None, memory_limit=None, temp_directory=None, skip_validation=False):
+    if skip_validation and publish:
+        raise ValueError("--skip-validation cannot be combined with --publish")
     if not quiescent:
         raise ValueError("stop Bronze writers and explicitly acknowledge quiescent inputs")
     selected = _selection(datasets, household)
@@ -207,11 +211,11 @@ def build(lake: Path, silver_root: Path, *, datasets=None, publish=False, househ
     with exclusive_lock(root):
         if (root / "current.json").exists():
             current = load_release(root)  # Corruption is not swallowed or treated as a cache miss.
-            if current["fingerprint"] == fingerprint:
+            if current["fingerprint"] == fingerprint and not skip_validation:
                 validate_release(root, current["release_id"])
                 return {"state": "no-op", "release_id": current["release_id"], "fingerprint": fingerprint}
         _event(root, run_id, "planned", fingerprint=fingerprint, scope=scope)
-        stage = stage_release(root, fingerprint)
+        stage = stage_release(root, fingerprint, category="unvalidated" if skip_validation else None)
         try:
             _event(root, run_id, "building")
             retained = retain_inputs(snapshot, stage / "inputs", copy_only=household)
@@ -245,14 +249,18 @@ def build(lake: Path, silver_root: Path, *, datasets=None, publish=False, househ
                         con.execute(f'COPY (SELECT * FROM "{name}") TO ? (FORMAT PARQUET, COMPRESSION ZSTD)', [str(target)])
                         con.execute(f'CREATE OR REPLACE TEMP VIEW "{name}" AS SELECT * FROM read_parquet({bundle._quote(str(target))})')
                         outputs[name] = {"path": relative, "sha256": _file_hash(target), "schema": bundle._schema(con, name)}
-                _event(root, run_id, "validating")
-                checks = validation.validate(con, registry, household=household)
-                captured = bundle.capture_bundle(con, stage, registry, checks)
-                outputs.update(captured["outputs"])
+                if skip_validation:
+                    checks = None
+                    captured = None
+                else:
+                    _event(root, run_id, "validating")
+                    checks = validation.validate(con, registry, household=household)
+                    captured = bundle.capture_bundle(con, stage, registry, checks)
+                    outputs.update(captured["outputs"])
             if spill.is_relative_to(stage):
                 shutil.rmtree(spill)
             _write_json(stage / "inputs.json", _portable(retained, stage))
-            _write_json(stage / "validation.json", checks)
+            _write_json(stage / "validation.json", {"status": "skipped"} if skip_validation else checks)
             if evidence is not None:
                 _write_json(stage / "readiness.json", evidence)
             for path in sorted(stage.rglob("*")):
@@ -264,22 +272,29 @@ def build(lake: Path, silver_root: Path, *, datasets=None, publish=False, househ
                           "manifest_sha256": snapshot["manifest_sha256"], "scope": scope,
                           "input_scope": snapshot["scope"], "restricted": household,
                           "approval_reference": approval if household else None,
-                          "registry": captured["registry"], "outputs": outputs, "gate_results": checks,
-                          "bundle_path": captured["bundle_path"], "bundle_sha256": captured["bundle_sha256"],
+                          "registry": captured["registry"] if captured else registry, "outputs": outputs,
+                          "validation_status": "skipped" if skip_validation else "passed",
+                          "state": "unvalidated" if skip_validation else "ready",
                           "resources": {"threads": threads, "memory_limit": memory_limit},
-                          "states": ["planned", "building", "validating", "ready"]}
+                          "states": ["planned", "building", "unvalidated"] if skip_validation else ["planned", "building", "validating", "ready"]}
+            if not skip_validation:
+                descriptor.update({"gate_results": checks, "bundle_path": captured["bundle_path"],
+                                   "bundle_sha256": captured["bundle_sha256"]})
             _write_json(stage / "release.json", descriptor)
             # Independent fresh session validates the exact staged artifact before any commit.
-            _replay(root, stage, descriptor)
+            if not skip_validation:
+                _replay(root, stage, descriptor)
             if household:
                 for path in stage.rglob("*"):
                     path.chmod(0o700 if path.is_dir() else 0o600)
-            _event(root, run_id, "ready", staging=stage.name)
+            final_state = "unvalidated" if skip_validation else "ready"
+            _event(root, run_id, final_state, staging=str(stage.relative_to(root / ".staging")))
             if publish:
                 result = publish_release(root, stage, descriptor)
                 _event(root, run_id, "published", release_id=result["release_id"])
                 return result
-            return {"state": "ready", "staging": str(stage), "fingerprint": fingerprint, "scope": scope}
+            return {"state": final_state, "staging": str(stage), "fingerprint": fingerprint, "scope": scope,
+                    "validation_status": "skipped" if skip_validation else "passed"}
         except Exception as error:
             # Keep the old pointer; an isolated failed staging tree is safe to remove.
             _event(root, run_id, "failed", error_type=type(error).__name__)

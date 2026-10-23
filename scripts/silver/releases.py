@@ -71,13 +71,17 @@ def _write_json_atomic(path: Path, value: dict) -> None:
             temp.unlink()
 
 
-def stage_release(root: Path, fingerprint: str) -> Path:
+def stage_release(root: Path, fingerprint: str, *, category: str | None = None) -> Path:
     """Create a unique staging directory on the managed release filesystem."""
     if not isinstance(fingerprint, str) or not _HEX.fullmatch(fingerprint):
         raise ValueError("fingerprint must be a lowercase SHA-256 hex digest")
     managed = _managed_root(root)
     staging_root = managed / ".staging"
-    staging_root.mkdir(mode=0o700, exist_ok=True)
+    if category is not None:
+        if category != "unvalidated":
+            raise ValueError("unsupported staging category")
+        staging_root = staging_root / category
+    staging_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     stage = staging_root / f"{fingerprint}-{uuid.uuid4().hex}"
     stage.mkdir(mode=0o700)
     _fsync_dir(staging_root)
@@ -119,6 +123,10 @@ def _output_entries(descriptor: dict) -> list[dict]:
 def _validate_descriptor(descriptor: dict, staging: Path, *, check_fingerprint: bool = True) -> list[dict]:
     if not isinstance(descriptor, dict):
         raise ValueError("descriptor must be an object")
+    if descriptor.get("state") == "unvalidated" or descriptor.get("validation_status") == "skipped":
+        raise ValueError("unvalidated artifacts are not publishable releases")
+    if descriptor.get("validation_status", "passed") != "passed":
+        raise ValueError("release validation status is not passed")
     required = ("fingerprint", "schema_version", "sources", "gate_results")
     if any(key not in descriptor for key in required):
         raise ValueError("descriptor is missing required release metadata")
@@ -227,6 +235,10 @@ def load_release(root: Path, release_id: str | None = None, *, verify: bool = Tr
     if not managed.is_dir():
         raise FileNotFoundError(managed)
     descriptor = _read_descriptor(managed, release_id)
+    if descriptor.get("state") == "unvalidated" or descriptor.get("validation_status") == "skipped":
+        raise ValueError("unvalidated artifacts are not managed releases")
+    if descriptor.get("validation_status", "passed") != "passed":
+        raise ValueError("release validation status is not passed")
     if verify:
         base = managed / "releases" / descriptor["release_id"]
         entries = _validate_descriptor(descriptor, base, check_fingerprint=False)
